@@ -489,6 +489,12 @@ huggingface-cli login
 | vllm         | 0.4.3   | 0.8.2     |
 | flash-attn   | 2.5.6   | 2.7.2     |
 
+| System (for multimodal audio/video models) | Minimum | Recommend |
+| ------------------------------------------ | ------- | --------- |
+| ffmpeg                                     | 4       | 7         |
+
+> **Note:** Models like Qwen3-Omni require `torchcodec` (installed automatically) which depends on FFmpeg shared libraries at runtime. Install FFmpeg via your system package manager or conda: `conda install -c conda-forge ffmpeg`. On HPC clusters, you may also need to set `LD_LIBRARY_PATH` to include the conda environment's `lib/` directory.
+
 ### Hardware Requirement
 
 \* *estimated*
