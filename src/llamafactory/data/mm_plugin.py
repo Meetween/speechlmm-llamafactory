@@ -2040,6 +2040,61 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
 
 @dataclass
+class SpeechLMMPlugin(Qwen2OmniPlugin):
+    """Plugin for SpeechLMM: handles input audio (mel features) and output
+    audio (codec tokens) for joint Thinker + Talker training.
+
+    Differences from Qwen2OmniPlugin:
+    - Assistant-turn <audio> tokens are wrapped with TTS boundary tokens
+      (<|tts_bos|> ... <|tts_eos|>) and NOT expanded into mel features.
+    - Supports a ``codec_tokens`` field (pre-computed codec token IDs) that
+      flows through as ``codec_labels`` in the batch dict.
+    """
+
+    tts_bos_token: str = "<|tts_bos|>"
+    tts_eos_token: str = "<|tts_eos|>"
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> list[dict[str, str]]:
+        """Process messages, distinguishing input audio (user turns) from
+        output audio (assistant turns).
+
+        - User-turn ``<audio>`` → expanded into mel-feature placeholder tokens
+          (delegated to the parent Qwen2OmniPlugin).
+        - Assistant-turn ``<audio>`` → wrapped with TTS boundary tokens. These
+          are NOT sent to the feature extractor; codec labels are supplied
+          separately via the ``codec_tokens`` dataset field.
+        """
+        messages = deepcopy(messages)
+        for message in messages:
+            if message.get("role") in ("assistant", "gpt"):
+                content = message["content"]
+                content = content.replace(
+                    AUDIO_PLACEHOLDER,
+                    f"{self.tts_bos_token}{self.tts_eos_token}",
+                )
+                message["content"] = content
+
+        input_audios = []
+        for message in messages:
+            if message.get("role") not in ("assistant", "gpt"):
+                input_audios.extend(
+                    [audios.pop(0) for _ in range(message["content"].count(AUDIO_PLACEHOLDER))]
+                    if audios
+                    else []
+                )
+
+        return super().process_messages(messages, images, videos, input_audios, processor)
+
+
+@dataclass
 class VideoLlavaPlugin(BasePlugin):
     @override
     def process_messages(
@@ -2213,6 +2268,7 @@ PLUGINS = {
     "qwen2_audio": Qwen2AudioPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,
+    "speechlmm": SpeechLMMPlugin,
     "qwen3_vl": Qwen3VLPlugin,
     "video_llava": VideoLlavaPlugin,
     "youtu_vl": YoutuVLPlugin,
