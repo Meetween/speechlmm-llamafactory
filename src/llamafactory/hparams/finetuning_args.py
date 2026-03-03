@@ -510,6 +510,23 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to freeze the language model in MLLM training."},
     )
+    freeze_talker: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the Talker (speech generation) sub-model in SpeechLMM training."},
+    )
+    freeze_code2wav: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the Code2Wav (waveform synthesis) sub-model in SpeechLMM training."},
+    )
+    freeze_code_predictor: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether or not to freeze the Talker's code_predictor (residual codebook predictor) "
+                "in SpeechLMM training. Only relevant when freeze_talker is False."
+            )
+        },
+    )
     compute_accuracy: bool = field(
         default=False,
         metadata={"help": "Whether or not to compute the token-level accuracy at evaluation."},

@@ -44,6 +44,8 @@ class CompositeModel:
     vision_model_keys: list[str]
     language_model_keys: list[str]
     lora_conflict_keys: list[str]
+    talker_keys: list[str]
+    code2wav_keys: list[str]
 
     def get_projector(self, module: "torch.nn.Module") -> "torch.nn.Module":
         for key in self.projector_key.split("."):
@@ -61,6 +63,8 @@ def _register_composite_model(
     vision_model_keys: Optional[list[str]] = None,
     language_model_keys: Optional[list[str]] = None,
     lora_conflict_keys: Optional[list[str]] = None,
+    talker_keys: Optional[list[str]] = None,
+    code2wav_keys: Optional[list[str]] = None,
 ):
     r"""Register a new composite model.
 
@@ -70,6 +74,8 @@ def _register_composite_model(
         vision_model_keys: vision_tower
         language_model_keys: language_model
         lora_conflict_keys: None
+        talker_keys: speech generation sub-model (e.g. SpeechLMM's Talker)
+        code2wav_keys: waveform synthesis sub-model (e.g. SpeechLMM's Code2Wav)
 
     """
     COMPOSITE_MODELS[model_type] = CompositeModel(
@@ -78,6 +84,8 @@ def _register_composite_model(
         vision_model_keys=vision_model_keys or ["vision_tower"],
         language_model_keys=language_model_keys or ["language_model", "lm_head"],
         lora_conflict_keys=lora_conflict_keys or [],
+        talker_keys=talker_keys or [],
+        code2wav_keys=code2wav_keys or [],
     )
 
 
@@ -157,24 +165,35 @@ def configure_visual_model(config: "PretrainedConfig") -> None:
 
 
 def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "FinetuningArguments") -> set[str]:
-    r"""Freeze vision tower and language model for VLM full/freeze tuning."""
+    r"""Freeze vision tower, language model, talker, and code2wav for VLM/SpeechLMM full/freeze tuning."""
     model_type = getattr(config, "model_type", None)
     forbidden_modules = set()
     if model_type in COMPOSITE_MODELS:
+        composite = COMPOSITE_MODELS[model_type]
+
         if finetuning_args.freeze_vision_tower:
-            vision_model_keys = COMPOSITE_MODELS[model_type].vision_model_keys
-            logger.info_rank0(f"Set vision model not trainable: {vision_model_keys}.")
-            forbidden_modules.update(vision_model_keys)
+            logger.info_rank0(f"Set vision model not trainable: {composite.vision_model_keys}.")
+            forbidden_modules.update(composite.vision_model_keys)
 
         if finetuning_args.freeze_multi_modal_projector:
-            projector_key = COMPOSITE_MODELS[model_type].projector_key
-            logger.info_rank0(f"Set multi model projector not trainable: {projector_key}.")
-            forbidden_modules.add(projector_key)
+            logger.info_rank0(f"Set multi model projector not trainable: {composite.projector_key}.")
+            forbidden_modules.add(composite.projector_key)
 
         if finetuning_args.freeze_language_model:
-            language_model_keys = COMPOSITE_MODELS[model_type].language_model_keys
-            logger.info_rank0(f"Set language model not trainable: {language_model_keys}.")
-            forbidden_modules.update(language_model_keys)
+            logger.info_rank0(f"Set language model not trainable: {composite.language_model_keys}.")
+            forbidden_modules.update(composite.language_model_keys)
+
+        if getattr(finetuning_args, "freeze_talker", False) and composite.talker_keys:
+            logger.info_rank0(f"Set talker not trainable: {composite.talker_keys}.")
+            forbidden_modules.update(composite.talker_keys)
+
+        if getattr(finetuning_args, "freeze_code2wav", False) and composite.code2wav_keys:
+            logger.info_rank0(f"Set code2wav not trainable: {composite.code2wav_keys}.")
+            forbidden_modules.update(composite.code2wav_keys)
+
+        if getattr(finetuning_args, "freeze_code_predictor", False):
+            logger.info_rank0("Set code_predictor not trainable: ['talker.code_predictor'].")
+            forbidden_modules.add("talker.code_predictor")
 
     return forbidden_modules
 
@@ -383,6 +402,23 @@ _register_composite_model(
     ],
     language_model_keys=["model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
+)
+
+
+_register_composite_model(
+    model_type="speechlmm",
+    projector_key="visual.merger",
+    vision_model_keys=[
+        "visual.pos_embed",
+        "visual.patch_embed",
+        "visual.blocks",
+        "visual.deepstack_merger_list",
+        "audio_tower",
+    ],
+    language_model_keys=["model", "lm_head"],
+    lora_conflict_keys=["patch_embed"],
+    talker_keys=["talker"],
+    code2wav_keys=["code2wav"],
 )
 
 

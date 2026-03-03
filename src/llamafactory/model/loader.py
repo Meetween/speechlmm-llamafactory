@@ -162,6 +162,13 @@ def load_model(
 
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
+        elif getattr(config, "model_type", None) == "speechlmm":
+            from speechlmm.models import SpeechLMMForConditionalGeneration
+
+            if model_args.train_from_scratch:
+                model = SpeechLMMForConditionalGeneration._from_config(config)
+            else:
+                model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
