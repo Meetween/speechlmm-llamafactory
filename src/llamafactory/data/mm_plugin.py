@@ -2045,14 +2045,14 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
     audio (codec tokens) for joint Thinker + Talker training.
 
     Differences from Qwen2OmniPlugin:
-    - Assistant-turn <audio> tokens are wrapped with TTS boundary tokens
-      (<|tts_bos|> ... <|tts_eos|>) and NOT expanded into mel features.
-    - Supports a ``codec_tokens`` field (pre-computed codec token IDs) that
-      flows through as ``codec_labels`` in the batch dict.
+    - Assistant-turn <audio> tokens are replaced with TTS boundary markers
+      from the Qwen3-Omni vocabulary. The actual target codec tokens are
+      supplied separately via the ``codec_tokens`` / ``codec_labels`` field.
+    - User-turn <audio> tokens are processed normally (mel features).
     """
 
-    tts_bos_token: str = "<|tts_bos|>"
-    tts_eos_token: str = "<|tts_eos|>"
+    tts_text_bos: str = "<tts_text_bos>"
+    tts_text_eod: str = "<tts_text_eod>"
 
     @override
     def process_messages(
@@ -2068,9 +2068,8 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
 
         - User-turn ``<audio>`` → expanded into mel-feature placeholder tokens
           (delegated to the parent Qwen2OmniPlugin).
-        - Assistant-turn ``<audio>`` → wrapped with TTS boundary tokens. These
-          are NOT sent to the feature extractor; codec labels are supplied
-          separately via the ``codec_tokens`` dataset field.
+        - Assistant-turn ``<audio>`` → replaced with TTS boundary tokens.
+          Codec labels are supplied separately via the ``codec_tokens`` field.
         """
         messages = deepcopy(messages)
         for message in messages:
@@ -2078,7 +2077,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
                 content = message["content"]
                 content = content.replace(
                     AUDIO_PLACEHOLDER,
-                    f"{self.tts_bos_token}{self.tts_eos_token}",
+                    f"{self.tts_text_bos}{self.tts_text_eod}",
                 )
                 message["content"] = content
 

@@ -169,6 +169,16 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration._from_config(config)
             else:
                 model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
+
+        elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
+            "qwen2_5_omni", "qwen3_omni_moe",
+        ):
+            from speechlmm.models import SpeechLMMForConditionalGeneration
+            from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
+
+            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config)
+            qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+            model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText

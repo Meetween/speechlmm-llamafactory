@@ -161,6 +161,10 @@ class BaseModelArguments:
         default=False,
         metadata={"help": "Whether or not to randomly initialize the model weights."},
     )
+    use_speechlmm_wrapper: bool = field(
+        default=False,
+        metadata={"help": "Wrap a Qwen3-Omni checkpoint in the SpeechLMM model (zero-copy)."},
+    )
     infer_backend: EngineName = field(
         default=EngineName.HF,
         metadata={"help": "Backend engine used at inference."},
