@@ -176,7 +176,10 @@ def load_model(
             from speechlmm.models import SpeechLMMForConditionalGeneration
             from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
 
-            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config)
+            config_overrides = {}
+            if getattr(finetuning_args, "freeze_language_model", False):
+                config_overrides["thinker_loss_weight"] = 0.0
+            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
             qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
             model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
         else:
