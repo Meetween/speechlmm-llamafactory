@@ -2045,14 +2045,11 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
     audio (codec tokens) for joint Thinker + Talker training.
 
     Differences from Qwen2OmniPlugin:
-    - Assistant-turn <audio> tokens are replaced with TTS boundary markers
-      from the Qwen3-Omni vocabulary. The actual target codec tokens are
-      supplied separately via the ``codec_tokens`` / ``codec_labels`` field.
-    - User-turn <audio> tokens are processed normally (mel features).
+    - Assistant-turn ``<audio>`` placeholders are stripped (the original
+      Qwen3-Omni Thinker never generates these tokens). Target codec tokens
+      are supplied separately via the ``codec_tokens`` / ``codec_labels`` field.
+    - User-turn ``<audio>`` tokens are processed normally (mel features).
     """
-
-    tts_text_bos: str = "<tts_text_bos>"
-    tts_text_eod: str = "<tts_text_eod>"
 
     @override
     def process_messages(
@@ -2074,12 +2071,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         messages = deepcopy(messages)
         for message in messages:
             if message.get("role") in ("assistant", "gpt"):
-                content = message["content"]
-                content = content.replace(
-                    AUDIO_PLACEHOLDER,
-                    f"{self.tts_text_bos}{self.tts_text_eod}",
-                )
-                message["content"] = content
+                message["content"] = message["content"].replace(AUDIO_PLACEHOLDER, "")
 
         input_audios = []
         for message in messages:

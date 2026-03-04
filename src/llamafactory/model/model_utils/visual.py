@@ -198,18 +198,37 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
     return forbidden_modules
 
 
+def _is_module_forbidden(name: str, freeze_modules: set[str], conflict_keys: set[str]) -> bool:
+    """Check whether *name* should be excluded from LoRA/training.
+
+    ``freeze_modules`` (vision tower, language model, talker, …) are matched
+    by **prefix**: ``"model"`` matches ``model.layers.0.q_proj`` but NOT
+    ``talker.model.layers.0.q_proj``.
+
+    ``conflict_keys`` (e.g. ``patch_embed``) keep the original **substring**
+    semantics because they denote module *types* that may appear at any depth.
+    """
+    for fm in freeze_modules:
+        if name == fm or name.startswith(fm + "."):
+            return True
+    for ck in conflict_keys:
+        if ck in name:
+            return True
+    return False
+
+
 def patch_target_modules(
     model: "PreTrainedModel", finetuning_args: "FinetuningArguments", target_modules: list[str]
 ) -> list[str]:
     r"""Freeze vision tower for VLM LoRA tuning."""
     model_type = getattr(model.config, "model_type", None)
     if model_type in COMPOSITE_MODELS:
-        forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
-        forbidden_modules.update(COMPOSITE_MODELS[model_type].lora_conflict_keys)
+        freeze_modules = get_forbidden_modules(model.config, finetuning_args)
+        conflict_keys = set(COMPOSITE_MODELS[model_type].lora_conflict_keys)
         module_names = []
         for name, _ in model.named_modules():
-            if any(target_module in name for target_module in target_modules) and not any(
-                forbidden_module in name for forbidden_module in forbidden_modules
+            if any(target_module in name for target_module in target_modules) and not _is_module_forbidden(
+                name, freeze_modules, conflict_keys
             ):
                 module_names.append(name)
 
