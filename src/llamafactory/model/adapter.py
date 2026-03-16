@@ -37,6 +37,13 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _matches_trainable_paths(name: str, paths: list[str] | None) -> bool:
+    """Check if a parameter name matches any of the trainable module path prefixes."""
+    if not paths:
+        return False
+    return any(name == p or name.startswith(p + ".") for p in paths)
+
+
 def _setup_full_tuning(
     model: "PreTrainedModel",
     finetuning_args: "FinetuningArguments",
@@ -47,9 +54,13 @@ def _setup_full_tuning(
         return
 
     logger.info_rank0("Fine-tuning method: Full")
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if not any(forbidden_module in name for forbidden_module in forbidden_modules):
+        if _matches_trainable_paths(name, trainable_paths):
+            if cast_trainable_params_to_fp32:
+                param.data = param.data.to(torch.float32)
+        elif not any(forbidden_module in name for forbidden_module in forbidden_modules):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         else:
@@ -127,9 +138,13 @@ def _setup_freeze_tuning(
     if not finetuning_args.freeze_multi_modal_projector and model_type in COMPOSITE_MODELS:
         trainable_layers.append(COMPOSITE_MODELS[model_type].projector_key)
 
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
+        if _matches_trainable_paths(name, trainable_paths):
+            if cast_trainable_params_to_fp32:
+                param.data = param.data.to(torch.float32)
+        elif any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
             forbidden_module in name for forbidden_module in forbidden_modules
         ):
             if cast_trainable_params_to_fp32:
