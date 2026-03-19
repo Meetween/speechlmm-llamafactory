@@ -177,7 +177,8 @@ def load_model(
             from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
 
             config_overrides = {}
-            if getattr(finetuning_args, "freeze_language_model", False):
+            has_trainable_adapters = bool(getattr(finetuning_args, "trainable_module_paths", None))
+            if getattr(finetuning_args, "freeze_language_model", False) and not has_trainable_adapters:
                 config_overrides["thinker_loss_weight"] = 0.0
             speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
             qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
