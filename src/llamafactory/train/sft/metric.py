@@ -59,25 +59,27 @@ def eval_logit_processor(logits: "torch.Tensor", labels: "torch.Tensor") -> "tor
 
 
 def _word_error_rate(pred_text: str, ref_text: str) -> float:
-    """Word-level Levenshtein distance normalised by reference length."""
-    pred_words = pred_text.strip().split()
-    ref_words = ref_text.strip().split()
-    if not ref_words:
-        return 0.0 if not pred_words else 1.0
-
-    n, m = len(ref_words), len(pred_words)
-    dp = list(range(m + 1))
-    for i in range(1, n + 1):
-        prev, dp[0] = dp[0], i
-        for j in range(1, m + 1):
-            temp = dp[j]
-            if ref_words[i - 1] == pred_words[j - 1]:
-                dp[j] = prev
-            else:
-                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
-            prev = temp
-
-    return dp[m] / n
+    """Compute WER using jiwer, with fallback to simple edit distance."""
+    try:
+        from jiwer import wer
+        return wer(ref_text, pred_text)
+    except ImportError:
+        ref_words = ref_text.strip().split()
+        pred_words = pred_text.strip().split()
+        if not ref_words:
+            return 0.0 if not pred_words else 1.0
+        n, m = len(ref_words), len(pred_words)
+        dp = list(range(m + 1))
+        for i in range(1, n + 1):
+            prev, dp[0] = dp[0], i
+            for j in range(1, m + 1):
+                temp = dp[j]
+                if ref_words[i - 1] == pred_words[j - 1]:
+                    dp[j] = prev
+                else:
+                    dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+                prev = temp
+        return dp[m] / n
 
 
 @dataclass
