@@ -77,7 +77,7 @@ def run_sft(
     if training_args.predict_with_generate:
         metric_module["compute_metrics"] = ComputeSimilarity(tokenizer=tokenizer)
     elif finetuning_args.compute_accuracy:
-        metric_module["compute_metrics"] = ComputeAccuracy()
+        metric_module["compute_metrics"] = ComputeAccuracy(tokenizer=tokenizer)
         metric_module["preprocess_logits_for_metrics"] = eval_logit_processor
 
     # Keyword arguments for `model.generate`
@@ -144,11 +144,11 @@ def run_sft(
         if trainer.is_world_process_zero() and finetuning_args.plot_loss:
             keys = ["loss"]
             if isinstance(dataset_module.get("eval_dataset"), dict):
-                keys += sum(
-                    [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
-                )
+                per_ds = [[f"eval_{key}_loss", f"eval_{key}_accuracy", f"eval_{key}_wer"]
+                          for key in dataset_module["eval_dataset"].keys()]
+                keys += sum(per_ds, [])
             else:
-                keys += ["eval_loss", "eval_accuracy"]
+                keys += ["eval_loss", "eval_accuracy", "eval_wer"]
 
             plot_loss(training_args.output_dir, keys=keys)
 

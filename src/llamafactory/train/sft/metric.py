@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -58,16 +58,42 @@ def eval_logit_processor(logits: "torch.Tensor", labels: "torch.Tensor") -> "tor
     return torch.argmax(logits, dim=-1)
 
 
+def _word_error_rate(pred_text: str, ref_text: str) -> float:
+    """Word-level Levenshtein distance normalised by reference length."""
+    pred_words = pred_text.strip().split()
+    ref_words = ref_text.strip().split()
+    if not ref_words:
+        return 0.0 if not pred_words else 1.0
+
+    n, m = len(ref_words), len(pred_words)
+    dp = list(range(m + 1))
+    for i in range(1, n + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, m + 1):
+            temp = dp[j]
+            if ref_words[i - 1] == pred_words[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+
+    return dp[m] / n
+
+
 @dataclass
 class ComputeAccuracy:
-    r"""Compute accuracy and support `batch_eval_metrics`."""
+    r"""Compute accuracy (and optionally teacher-forced WER) and support `batch_eval_metrics`."""
+
+    tokenizer: Optional["PreTrainedTokenizer"] = field(default=None, repr=False)
 
     def _dump(self) -> Optional[dict[str, float]]:
         result = None
         if hasattr(self, "score_dict"):
-            result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
+            result = {k: float(np.mean(v)) for k, v in self.score_dict.items() if v}
 
-        self.score_dict = {"accuracy": []}
+        self.score_dict: dict[str, list[float]] = {"accuracy": []}
+        if self.tokenizer is not None:
+            self.score_dict["wer"] = []
         return result
 
     def __post_init__(self):
@@ -79,6 +105,12 @@ class ComputeAccuracy:
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
             self.score_dict["accuracy"].append(np.mean(pred[label_mask] == label[label_mask]))
+
+            if self.tokenizer is not None:
+                pred_text = self.tokenizer.decode(pred[label_mask], skip_special_tokens=True)
+                label_text = self.tokenizer.decode(label[label_mask], skip_special_tokens=True)
+                if label_text.strip():
+                    self.score_dict["wer"].append(_word_error_rate(pred_text, label_text))
 
         if compute_result:
             return self._dump()
