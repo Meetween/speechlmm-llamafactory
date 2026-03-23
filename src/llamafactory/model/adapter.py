@@ -228,7 +228,9 @@ def _setup_lora_tuning(
 
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+            target_modules = find_all_linear_modules(
+                model, finetuning_args.freeze_vision_tower, finetuning_args.freeze_audio_tower
+            )
         else:
             target_modules = finetuning_args.lora_target
 

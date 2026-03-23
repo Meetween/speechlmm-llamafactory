@@ -510,7 +510,11 @@ class FinetuningArguments(
     )
     freeze_vision_tower: bool = field(
         default=True,
-        metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
+        metadata={"help": "Whether or not to freeze the vision tower in MLLM training."},
+    )
+    freeze_audio_tower: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the audio tower in SpeechLMM training."},
     )
     freeze_multi_modal_projector: bool = field(
         default=True,

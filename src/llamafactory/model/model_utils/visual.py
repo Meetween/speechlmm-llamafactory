@@ -44,6 +44,7 @@ class CompositeModel:
     vision_model_keys: list[str]
     language_model_keys: list[str]
     lora_conflict_keys: list[str]
+    audio_model_keys: list[str]
     talker_keys: list[str]
     code2wav_keys: list[str]
 
@@ -63,6 +64,7 @@ def _register_composite_model(
     vision_model_keys: Optional[list[str]] = None,
     language_model_keys: Optional[list[str]] = None,
     lora_conflict_keys: Optional[list[str]] = None,
+    audio_model_keys: Optional[list[str]] = None,
     talker_keys: Optional[list[str]] = None,
     code2wav_keys: Optional[list[str]] = None,
 ):
@@ -74,6 +76,7 @@ def _register_composite_model(
         vision_model_keys: vision_tower
         language_model_keys: language_model
         lora_conflict_keys: None
+        audio_model_keys: audio encoder (separate from vision for independent freeze control)
         talker_keys: speech generation sub-model (e.g. SpeechLMM's Talker)
         code2wav_keys: waveform synthesis sub-model (e.g. SpeechLMM's Code2Wav)
 
@@ -84,6 +87,7 @@ def _register_composite_model(
         vision_model_keys=vision_model_keys or ["vision_tower"],
         language_model_keys=language_model_keys or ["language_model", "lm_head"],
         lora_conflict_keys=lora_conflict_keys or [],
+        audio_model_keys=audio_model_keys or [],
         talker_keys=talker_keys or [],
         code2wav_keys=code2wav_keys or [],
     )
@@ -174,6 +178,10 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
         if finetuning_args.freeze_vision_tower:
             logger.info_rank0(f"Set vision model not trainable: {composite.vision_model_keys}.")
             forbidden_modules.update(composite.vision_model_keys)
+
+        if getattr(finetuning_args, "freeze_audio_tower", True) and composite.audio_model_keys:
+            logger.info_rank0(f"Set audio model not trainable: {composite.audio_model_keys}.")
+            forbidden_modules.update(composite.audio_model_keys)
 
         if finetuning_args.freeze_multi_modal_projector:
             logger.info_rank0(f"Set multi model projector not trainable: {composite.projector_key}.")
@@ -432,10 +440,10 @@ _register_composite_model(
         "visual.patch_embed",
         "visual.blocks",
         "visual.deepstack_merger_list",
-        "audio_tower",
     ],
     language_model_keys=["model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
+    audio_model_keys=["audio_tower"],
     talker_keys=["talker"],
     code2wav_keys=["code2wav"],
 )
