@@ -106,17 +106,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             self.get_rope_func = None
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
-        batch_images, batch_videos, batch_audios = [], [], []
+        batch_images, batch_videos, batch_audios, batch_lipread = [], [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         batch_codec_tokens: list[list[int] | None] = []
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+            lipread = feature.pop("lipread", None) or []
             codec_tokens = feature.pop("codec_tokens", None)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
+            batch_lipread.extend(lipread)
             batch_imglens.append(len(images))
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
@@ -177,6 +179,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_audlens,
             batch_input_ids,
             self.processor,
+            lipread=batch_lipread,
         )
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")

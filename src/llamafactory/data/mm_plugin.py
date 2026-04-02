@@ -155,8 +155,16 @@ class MMPluginMixin:
         images: list["ImageInput"],
         videos: list["VideoInput"],
         audios: list["AudioInput"],
+        lipread: list["VideoInput"]=[],
+        debug=False,
     ) -> None:
         r"""Validate if this model accepts the input modalities."""
+
+        # skip checks if debug set to true
+        if debug:
+            return
+
+
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseImageProcessor = getattr(
             processor, "video_processor", getattr(processor, "image_processor", None)
@@ -328,6 +336,7 @@ class MMPluginMixin:
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: "MMProcessor",
+        lipread: list["VideoInput"] = [],
         imglens: list[int] | None = None,
     ) -> dict[str, "torch.Tensor"]:
         r"""Process visual inputs.
@@ -432,9 +441,10 @@ class BasePlugin(MMPluginMixin):
         audios: list["AudioInput"],
         tokenizer: "PreTrainedTokenizer",
         processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"]=[],
     ) -> tuple[list[int], list[int] | None]:
         r"""Pre-process token ids after tokenization for VLMs."""
-        self._validate_input(processor, images, videos, audios)
+        self._validate_input(processor, images, videos, audios, debug=True)
         return input_ids, labels
 
     def get_mm_inputs(
@@ -447,6 +457,7 @@ class BasePlugin(MMPluginMixin):
         audlens: list[int],
         batch_ids: list[list[int]],
         processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"] = [],
     ) -> dict[str, Union[list[int], "torch.Tensor"]]:
         r"""Build batched multimodal inputs for VLMs.
 
@@ -461,8 +472,8 @@ class BasePlugin(MMPluginMixin):
             processor: a processor for pre-processing images and videos
 
         """
-        self._validate_input(processor, images, videos, audios)
-        return self._get_mm_inputs(images, videos, audios, processor)
+        self._validate_input(processor, images, videos, audios, lipread=lipread)
+        return self._get_mm_inputs(images, videos, audios, processor, lipread=lipread)
 
 
 @dataclass
@@ -1873,6 +1884,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: "MMProcessor",
+        lipread=[]
     ) -> dict[str, "torch.Tensor"]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseVideoProcessor = getattr(processor, "video_processor", None)
@@ -1915,7 +1927,6 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 )
             )
             mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask")  # prevent conflicts
-
         return mm_inputs
 
     @override
@@ -1927,7 +1938,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
-        self._validate_input(processor, images, videos, audios)
+        self._validate_input(processor, images, videos, audios, debug=True)
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens, num_video_tokens, num_audio_tokens = 0, 0, 0
         messages = deepcopy(messages)
