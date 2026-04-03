@@ -196,11 +196,11 @@ class SaveTrainableModulesCallback(TrainerCallback):
         if is_deepspeed_zero3_enabled():
             import deepspeed
 
-            with deepspeed.zero.GatheredParameters(list(model.parameters()), modifier_rank=0):
-                for name, param in model.named_parameters():
-                    if self._matches(name):
-                        clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
-                        state[clean] = param.data.clone().cpu()
+            matched = [(n, p) for n, p in model.named_parameters() if self._matches(n)]
+            with deepspeed.zero.GatheredParameters([p for _, p in matched], modifier_rank=0):
+                for name, param in matched:
+                    clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+                    state[clean] = param.data.clone().cpu()
         else:
             for name, param in model.named_parameters():
                 if self._matches(name):
@@ -217,14 +217,12 @@ class SaveTrainableModulesCallback(TrainerCallback):
 
     @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        if args.should_save:
-            output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-            self._save_trainable_modules(kwargs["model"], output_dir)
+        output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+        self._save_trainable_modules(kwargs["model"], output_dir)
 
     @override
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        if args.should_save:
-            self._save_trainable_modules(kwargs["model"], args.output_dir)
+        self._save_trainable_modules(kwargs["model"], args.output_dir)
 
 
 class LogCallback(TrainerCallback):
