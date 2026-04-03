@@ -169,6 +169,64 @@ class PissaConvertCallback(TrainerCallback):
                 setattr(model.peft_config["default"], "init_lora_weights", init_lora_weights)
 
 
+TRAINABLE_MODULES_FILENAME = "trainable_modules.safetensors"
+
+
+class SaveTrainableModulesCallback(TrainerCallback):
+    """Saves full-weight modules trained via trainable_module_paths alongside the PEFT adapter.
+
+    PEFT's save_pretrained only persists LoRA weights.  Modules unlocked by
+    trainable_module_paths (e.g. projection layers) would otherwise be lost
+    when saving a checkpoint, surviving only in the DeepSpeed ZeRO shard files.
+    This callback extracts those weights and writes them as a separate
+    safetensors file in every checkpoint directory.
+    """
+
+    def __init__(self, trainable_module_paths: list[str]) -> None:
+        self.trainable_module_paths = trainable_module_paths
+
+    def _matches(self, name: str) -> bool:
+        clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+        return any(clean == p or clean.startswith(p + ".") for p in self.trainable_module_paths)
+
+    def _save_trainable_modules(self, model, output_dir: str) -> None:
+        from transformers.integrations import is_deepspeed_zero3_enabled
+
+        state = {}
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
+
+            with deepspeed.zero.GatheredParameters(list(model.parameters()), modifier_rank=0):
+                for name, param in model.named_parameters():
+                    if self._matches(name):
+                        clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+                        state[clean] = param.data.clone().cpu()
+        else:
+            for name, param in model.named_parameters():
+                if self._matches(name):
+                    clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+                    state[clean] = param.data.clone().cpu()
+
+        is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        if state and is_main:
+            os.makedirs(output_dir, exist_ok=True)
+            save_file(state, os.path.join(output_dir, TRAINABLE_MODULES_FILENAME), metadata={"format": "pt"})
+            logger.info_rank0(
+                f"Saved {len(state)} trainable_module_paths weights to {output_dir}/{TRAINABLE_MODULES_FILENAME}"
+            )
+
+    @override
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if args.should_save:
+            output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+            self._save_trainable_modules(kwargs["model"], output_dir)
+
+    @override
+    def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if args.should_save:
+            self._save_trainable_modules(kwargs["model"], args.output_dir)
+
+
 class LogCallback(TrainerCallback):
     r"""A callback for logging training and evaluation status."""
 
