@@ -133,9 +133,12 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
         _set_z3_leaf_modules(model, [Qwen3VLMoeTextSparseMoeBlock])
 
     if model_type in ("qwen3_omni_moe", "qwen3_omni_moe_thinker", "speechlmm"):
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerTextSparseMoeBlock
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeAudioEncoder,
+            Qwen3OmniMoeThinkerTextSparseMoeBlock,
+        )
 
-        _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
+        _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock, Qwen3OmniMoeAudioEncoder])
 
 
 def configure_moe(config: "PretrainedConfig", model_args: "ModelArguments", is_trainable: bool) -> None:
