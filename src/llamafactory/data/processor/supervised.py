@@ -41,7 +41,11 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         audios: list["AudioInput"],
         lipread: list["VideoInput"],
     ) -> tuple[list[int], list[int]]:
-        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+
+        if lipread is not None and len(lipread) > 0:
+            messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor, lipread=lipread)
+        else:
+            messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
         input_ids, labels = self.template.mm_plugin.process_token_ids(
             [], [], images, videos, audios, self.tokenizer, self.processor
         )
