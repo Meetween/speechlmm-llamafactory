@@ -532,6 +532,10 @@ class FinetuningArguments(
         default=True,
         metadata={"help": "Whether or not to freeze the Code2Wav (waveform synthesis) sub-model in SpeechLMM training."},
     )
+    freeze_lipread_encoder: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the lipread_encoder (Auto_AVSR) sub-model in SpeechLMM training."},
+    )
     freeze_code_predictor: bool = field(
         default=True,
         metadata={
