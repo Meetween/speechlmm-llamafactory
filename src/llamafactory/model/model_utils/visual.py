@@ -208,7 +208,7 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
 
         if getattr(finetuning_args, "freeze_lipread_encoder", False):
             logger.info_rank0("Set lipread_encoder not trainable: ['lipread_encoder'].")
-            forbidden_modules.add("lipread_encoder")
+            forbidden_modules.update(composite.lipread_keys)
 
     return forbidden_modules
 
