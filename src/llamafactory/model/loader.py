@@ -180,9 +180,10 @@ def load_model(
             has_trainable_adapters = bool(getattr(finetuning_args, "trainable_module_paths", None))
             if getattr(finetuning_args, "freeze_language_model", False) and not has_trainable_adapters:
                 config_overrides["thinker_loss_weight"] = 0.0
-                config_overrides["lipread_bos_token_id"] = tokenizer.vocab['<|lipread_start|>']
-                config_overrides["lipread_eos_token_id"] = tokenizer.vocab['<|lipread_end|>']
-                config_overrides["lipread_pad_token_id"] = tokenizer.vocab['<|lipread_pad|>']
+
+            config_overrides["lipread_bos_token_id"] = tokenizer.vocab['<|lipread_start|>']
+            config_overrides["lipread_eos_token_id"] = tokenizer.vocab['<|lipread_end|>']
+            config_overrides["lipread_pad_token_id"] = tokenizer.vocab['<|lipread_pad|>']
 
             speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
             qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)

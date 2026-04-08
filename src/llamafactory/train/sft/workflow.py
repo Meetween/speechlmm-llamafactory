@@ -47,8 +47,8 @@ def run_sft(
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
     if model_args.use_speechlmm_wrapper:
-        original_add_special_tokens= "" if getattr(model_args,"add_special_tokens",None) is None else model_args.add_special_tokens
-        lipread_tokens=",<|lipread_start|>,<|lipread_pad|>,<|lipread_end|>"
+        original_add_special_tokens= [] if getattr(model_args,"add_special_tokens",None) is None else model_args.add_special_tokens
+        lipread_tokens=["<|lipread_start|>", "<|lipread_pad|>", "<|lipread_end|>"]
         model_args.add_special_tokens=original_add_special_tokens+lipread_tokens
 
     tokenizer_module = load_tokenizer(model_args)
