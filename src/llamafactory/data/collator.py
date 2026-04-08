@@ -261,11 +261,11 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             lengths= [x.shape[0] for x in features['lipread']]
             max_length = max(lengths)
             lipread_padded = torch.zeros((len(features['lipread']), max_length, 88, 88))
-            lipread_mask = torch.zeros((len(features['lipread']), max_length), dtype=torch.uint8)
+            lipread_mask = torch.zeros((len(features['lipread']), max_length,max_length), dtype=torch.uint8)
 
             for i in range(len(features['lipread'])):
                 lipread_padded[i, :lengths[i]] = features['lipread'][i][:,0,:,:]
-                lipread_mask[i, :lengths[i]] = 1
+                lipread_mask[i, :lengths[i],:lengths[i]] = 1
             
             features['lipread'] = lipread_padded
             features['lipread_mask'] = lipread_mask
