@@ -2059,7 +2059,12 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 class LipreadProcessor:
 
     H, W = 88, 88
-    transforms = v2.Compose([v2.Grayscale(), v2.ToTensor()])
+    transforms = v2.Compose([
+                    v2.Grayscale(),
+                    v2.ToTensor(),
+                    v2.ToDtype(torch.float, scale=True),
+                    v2.Normalize(mean=[0.421], std=[0.165])
+                    ])
 
     def __call__(self, video_path):
         videoDec= VideoDecoder(video_path, transforms= [Resize((self.H, self.W))])
