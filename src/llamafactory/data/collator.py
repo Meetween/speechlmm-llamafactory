@@ -256,6 +256,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                     padded_codec.append(ct + [IGNORE_INDEX] * (max_codec_len - len(ct)))
             features["codec_labels"] = torch.tensor(padded_codec, dtype=torch.long)
 
+        # create lipread batch
+        if len(batch_lipread)>0:
+            lengths= [x.shape[0] for x in features['lipread']]
+            max_length = max(lengths)
+            lipread_padded = torch.zeros((len(features['lipread']), max_length, 88, 88))
+            lipread_mask = torch.zeros((len(features['lipread']), max_length), dtype=torch.uint8)
+
+            for i in range(len(features['lipread'])):
+                lipread_padded[i, :lengths[i]] = features['lipread'][i][:,0,:,:]
+                lipread_mask[i, :lengths[i]] = 1
+            
+            features['lipread'] = lipread_padded
+            features['lipread_mask'] = lipread_mask
         return features
 
 
