@@ -173,13 +173,17 @@ TRAINABLE_MODULES_FILENAME = "trainable_modules.safetensors"
 
 
 class SaveTrainableModulesCallback(TrainerCallback):
-    """Saves full-weight modules trained via trainable_module_paths alongside the PEFT adapter.
+    """Saves full-weight modules trained via trainable_module_paths.
 
-    PEFT's save_pretrained only persists LoRA weights.  Modules unlocked by
-    trainable_module_paths (e.g. projection layers) would otherwise be lost
-    when saving a checkpoint, surviving only in the DeepSpeed ZeRO shard files.
-    This callback extracts those weights and writes them as a separate
-    safetensors file in every checkpoint directory.
+    When using PEFT (LoRA/OFT), save_pretrained only persists adapter
+    weights.  When using full finetuning with mostly-frozen parameters,
+    save_pretrained writes the entire model (~60 GB for a 30B model)
+    even though only a few tensors changed.
+
+    In both cases this callback extracts the trainable_module_paths
+    weights into a small ``trainable_modules.safetensors`` file in every
+    checkpoint directory.  An export script can then reconstruct the
+    full model from base_model + adapter (if any) + this file.
     """
 
     def __init__(self, trainable_module_paths: list[str]) -> None:

@@ -70,7 +70,7 @@ def _training_function(config: dict[str, Any]) -> None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=finetuning_args.early_stopping_steps))
 
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
-    if trainable_paths and finetuning_args.finetuning_type in ("lora", "oft"):
+    if trainable_paths:
         callbacks.append(SaveTrainableModulesCallback(trainable_paths))
 
     callbacks.append(ReporterCallback(model_args, data_args, finetuning_args, generating_args))  # add to last
