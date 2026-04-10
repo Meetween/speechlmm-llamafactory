@@ -536,6 +536,10 @@ class FinetuningArguments(
         default=True,
         metadata={"help": "Whether or not to freeze the lipread_encoder (Auto_AVSR) sub-model in SpeechLMM training."},
     )
+    freeze_lipread_adapter: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the lipread adapter  sub-model in SpeechLMM training."},
+    )
     freeze_code_predictor: bool = field(
         default=True,
         metadata={

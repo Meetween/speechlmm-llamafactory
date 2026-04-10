@@ -47,7 +47,8 @@ class CompositeModel:
     audio_model_keys: list[str]
     talker_keys: list[str]
     code2wav_keys: list[str]
-    lipread_keys: list[str] 
+    lipread_encoder_keys: list[str]
+    lipread_adapter_keys: list[str]
 
     def get_projector(self, module: "torch.nn.Module") -> "torch.nn.Module":
         for key in self.projector_key.split("."):
@@ -68,7 +69,8 @@ def _register_composite_model(
     audio_model_keys: Optional[list[str]] = None,
     talker_keys: Optional[list[str]] = None,
     code2wav_keys: Optional[list[str]] = None,
-    lipread_keys: Optional[list[str]] = None,
+    lipread_encoder_keys: Optional[list[str]] = None,
+    lipread_adapter_keys: Optional[list[str]] = None,
 ):
     r"""Register a new composite model.
 
@@ -92,7 +94,8 @@ def _register_composite_model(
         audio_model_keys=audio_model_keys or [],
         talker_keys=talker_keys or [],
         code2wav_keys=code2wav_keys or [],
-        lipread_keys=lipread_keys or [],
+        lipread_encoder_keys=lipread_encoder_keys or [],
+        lipread_adapter_keys=lipread_adapter_keys or [],
     )
 
 
@@ -208,7 +211,11 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
 
         if getattr(finetuning_args, "freeze_lipread_encoder", False):
             logger.info_rank0("Set lipread_encoder not trainable: ['lipread_encoder'].")
-            forbidden_modules.update(composite.lipread_keys)
+            forbidden_modules.update(composite.lipread_encoder_keys)
+
+        if getattr(finetuning_args, "freeze_lipread_adapter", False):
+            logger.info_rank0("Set lipread_adapter not trainable: ['lipread_adapter'].")
+            forbidden_modules.update(composite.lipread_adapter_keys)
 
     return forbidden_modules
 
@@ -453,7 +460,8 @@ _register_composite_model(
     audio_model_keys=["audio_tower"],
     talker_keys=["talker"],
     code2wav_keys=["code2wav"],
-    lipread_keys=["lipread_encoder"],
+    lipread_encoder_keys=["lipread_encoder"],
+    lipread_adapter_keys=["lipread_adapter"],
 )
 
 
