@@ -165,6 +165,10 @@ class BaseModelArguments:
         default=False,
         metadata={"help": "Wrap a Qwen3-Omni checkpoint in the SpeechLMM model (zero-copy)."},
     )
+    lipreading_encoder_weights: str | None = field(
+        default=None,
+        metadata={"help": "Path to the Lipreading encoder weights."},
+    )
     infer_backend: EngineName = field(
         default=EngineName.HF,
         metadata={"help": "Backend engine used at inference."},
