@@ -20,7 +20,7 @@ import math
 import os
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING, BinaryIO, Literal, NotRequired, Optional, TypedDict, Union
 
@@ -34,7 +34,18 @@ from transformers.models.mllama.processing_mllama import (
 )
 from typing_extensions import override
 
-from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
+from ..extras.constants import (
+    AUDIO_PLACEHOLDER,
+    IGNORE_INDEX,
+    IMAGE_PLACEHOLDER,
+    LIPREAD_BOS_TOKEN,
+    LIPREAD_EOS_TOKEN,
+    LIPREAD_FPS,
+    LIPREAD_FRAME_SIZE,
+    LIPREAD_PAD_TOKEN,
+    LIPREAD_PLACEHOLDER,
+    VIDEO_PLACEHOLDER,
+)
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
 
 
@@ -161,16 +172,9 @@ class MMPluginMixin:
         images: list["ImageInput"],
         videos: list["VideoInput"],
         audios: list["AudioInput"],
-        lipread: list["VideoInput"]=[],
-        debug=False,
+        lipread: list["VideoInput"] | None = None,
     ) -> None:
         r"""Validate if this model accepts the input modalities."""
-
-        # skip checks if debug set to true
-        if debug:
-            return
-
-
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseImageProcessor = getattr(
             processor, "video_processor", getattr(processor, "image_processor", None)
@@ -342,7 +346,7 @@ class MMPluginMixin:
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: "MMProcessor",
-        lipread: list["VideoInput"] = [],
+        lipread: list["VideoInput"] | None = None,
         imglens: list[int] | None = None,
     ) -> dict[str, "torch.Tensor"]:
         r"""Process visual inputs.
@@ -447,10 +451,10 @@ class BasePlugin(MMPluginMixin):
         audios: list["AudioInput"],
         tokenizer: "PreTrainedTokenizer",
         processor: Optional["MMProcessor"],
-        lipread: list["VideoInput"]=[],
+        lipread: list["VideoInput"] | None = None,
     ) -> tuple[list[int], list[int] | None]:
         r"""Pre-process token ids after tokenization for VLMs."""
-        self._validate_input(processor, images, videos, audios, debug=True)
+        self._validate_input(processor, images, videos, audios)
         return input_ids, labels
 
     def get_mm_inputs(
@@ -463,7 +467,7 @@ class BasePlugin(MMPluginMixin):
         audlens: list[int],
         batch_ids: list[list[int]],
         processor: Optional["MMProcessor"],
-        lipread: list["VideoInput"] = [],
+        lipread: list["VideoInput"] | None = None,
     ) -> dict[str, Union[list[int], "torch.Tensor"]]:
         r"""Build batched multimodal inputs for VLMs.
 
@@ -476,6 +480,7 @@ class BasePlugin(MMPluginMixin):
             audlens: number of audios in each sample, shape (batch_size,)
             batch_ids: token ids of input samples, shape (batch_size, seq_len)
             processor: a processor for pre-processing images and videos
+            lipread: optional list of lipread video inputs
 
         """
         self._validate_input(processor, images, videos, audios, lipread=lipread)
@@ -1890,7 +1895,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: "MMProcessor",
-        lipread=[]
+        lipread: list["VideoInput"] | None = None,
     ) -> dict[str, "torch.Tensor"]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseVideoProcessor = getattr(processor, "video_processor", None)
@@ -1944,7 +1949,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
-        self._validate_input(processor, images, videos, audios, debug=True)
+        self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens, num_video_tokens, num_audio_tokens = 0, 0, 0
         messages = deepcopy(messages)
@@ -2055,31 +2060,32 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
         return messages
 
+
 @dataclass
 class LipreadProcessor:
-
-    H, W = 88, 88
-    transforms = v2.Compose([
-                    v2.Grayscale(),
-                    v2.ToTensor(),
-                    v2.ToDtype(torch.float, scale=True),
-                    v2.Normalize(mean=[0.421], std=[0.165])
-                    ])
+    H: int = LIPREAD_FRAME_SIZE
+    W: int = LIPREAD_FRAME_SIZE
+    transforms: v2.Compose = field(
+        default_factory=lambda: v2.Compose(
+            [
+                v2.Grayscale(),
+                v2.ToTensor(),
+                v2.ToDtype(torch.float, scale=True),
+                v2.Normalize(mean=[0.421], std=[0.165]),
+            ]
+        )
+    )
 
     def __call__(self, video_path):
-        videoDec= VideoDecoder(video_path, transforms= [Resize((self.H, self.W))])
-        video= clips_at_regular_timestamps(videoDec, seconds_between_clip_starts= 1/25)
-        video=self.transforms(video.data) # [t,b,1,88,88]
-        return video[:,0,:,:] #unsqueeze to remove batch dimension
-
-
-        
+        video_dec = VideoDecoder(video_path, transforms=[Resize((self.H, self.W))])
+        video = clips_at_regular_timestamps(video_dec, seconds_between_clip_starts=1 / LIPREAD_FPS)
+        video = self.transforms(video.data)  # [t, b, 1, H, W]
+        return video[:, 0, :, :]
 
 
 @dataclass
 class SpeechLMMPlugin(Qwen2OmniPlugin):
-    """Plugin for SpeechLMM: handles input audio (mel features) and output
-    audio (codec tokens) for joint Thinker + Talker training.
+    """Plugin for SpeechLMM: handles input audio (mel features) and output audio (codec tokens).
 
     Differences from Qwen2OmniPlugin:
     - Assistant-turn ``<audio>`` placeholders are stripped (the original
@@ -2087,22 +2093,27 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
       are supplied separately via the ``codec_tokens`` / ``codec_labels`` field.
     - User-turn ``<audio>`` tokens are processed normally (mel features).
     """
-    lipread_processor = LipreadProcessor()
-    lipread_bos_token: str = "<|lipread_start|>"
-    lipread_token: str = "<|lipread_pad|>"
-    lipread_eos_token: str = "<|lipread_end|>"
 
+    lipread_processor = LipreadProcessor()
+    lipread_bos_token: str = LIPREAD_BOS_TOKEN
+    lipread_token: str = LIPREAD_PAD_TOKEN
+    lipread_eos_token: str = LIPREAD_EOS_TOKEN
 
     @override
-    def _get_mm_inputs(self, images: list["ImageInput"], videos: list["VideoInput"], audios: list["AudioInput"], processor: "MMProcessor", lipread=[]) -> dict[str, "torch.Tensor"]:
-        mm_inputs= super()._get_mm_inputs(images, videos, audios, processor)
-        videos=[]
-        for lr_video in lipread:
-            video=self.lipread_processor(lr_video)
-            videos.append(video)
-        mm_inputs["lipread"]=videos
+    def _get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: "MMProcessor",
+        lipread: list["VideoInput"] | None = None,
+    ) -> dict[str, "torch.Tensor"]:
+        mm_inputs = super()._get_mm_inputs(images, videos, audios, processor)
+        processed = []
+        for lr_video in lipread or []:
+            processed.append(self.lipread_processor(lr_video))
+        mm_inputs["lipread"] = processed
         return mm_inputs
-
 
     @override
     def process_messages(
@@ -2112,14 +2123,13 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
-        lipread: list["VideoInput"] = [],
+        lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
-        """Process messages, distinguishing input audio (user turns) from
-        output audio (assistant turns).
+        """Process messages, distinguishing input audio (user turns) from output audio (assistant turns).
 
-        - User-turn ``<audio>`` → expanded into mel-feature placeholder tokens
+        - User-turn ``<audio>`` -> expanded into mel-feature placeholder tokens
           (delegated to the parent Qwen2OmniPlugin).
-        - Assistant-turn ``<audio>`` → replaced with TTS boundary tokens.
+        - Assistant-turn ``<audio>`` -> replaced with TTS boundary tokens.
           Codec labels are supplied separately via the ``codec_tokens`` field.
         """
         messages = deepcopy(messages)
@@ -2131,15 +2141,12 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         for message in messages:
             if message.get("role") not in ("assistant", "gpt"):
                 input_audios.extend(
-                    [audios.pop(0) for _ in range(message["content"].count(AUDIO_PLACEHOLDER))]
-                    if audios
-                    else []
+                    [audios.pop(0) for _ in range(message["content"].count(AUDIO_PLACEHOLDER))] if audios else []
                 )
-        if lipread is not None and len(lipread) > 0:
+        if lipread:
             return self._process_messages(messages, images, videos, input_audios, processor, lipread=lipread)
         else:
             return super().process_messages(messages, images, videos, input_audios, processor)
-
 
     def _process_messages(
         self,
@@ -2148,9 +2155,9 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
-        lipread: list["VideoInput"] = []
+        lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
-        self._validate_input(processor, images, videos, audios, debug=True)
+        self._validate_input(processor, images, videos, audios, lipread=lipread)
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens, num_video_tokens, num_audio_tokens, num_lipread_tokens = 0, 0, 0, 0
         messages = deepcopy(messages)
@@ -2159,7 +2166,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         merge_length = processor.image_processor.merge_size**2
         use_audio_in_video = getattr(processor, "use_audio_in_video", False)
         if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor,lipread=lipread)
+            mm_inputs = self._get_mm_inputs(images, videos, audios, processor, lipread=lipread)
             image_grid_thw = mm_inputs.get("image_grid_thw", [])
             video_grid_thw = mm_inputs.get("video_grid_thw", [])
             if "feature_attention_mask" in mm_inputs:
@@ -2256,14 +2263,14 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
                         1,
                     )
                     num_video_tokens += 1
-            if "<lipread>" in content:
-                video_len=mm_inputs['lipread'][num_lipread_tokens].shape[0]
+            if LIPREAD_PLACEHOLDER in content:
+                video_len = mm_inputs["lipread"][num_lipread_tokens].shape[0]
                 content = content.replace(
-                    "<lipread>",
+                    LIPREAD_PLACEHOLDER,
                     f"{self.lipread_bos_token}{self.lipread_token * video_len}{self.lipread_eos_token}",
-                    1)
+                    1,
+                )
                 num_lipread_tokens += 1
-
 
             message["content"] = content
 

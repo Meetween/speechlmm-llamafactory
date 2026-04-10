@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from peft import PeftModel
 from transformers import DataCollatorForSeq2Seq
 
-from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
+from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, LIPREAD_FRAME_SIZE
 from ..extras.packages import is_pillow_available
 
 
@@ -200,7 +200,11 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             elif "video_second_per_grid" in mm_inputs:  # for qwen2.5 omni
                 rope_index_kwargs["second_per_grids"] = mm_inputs.get("video_second_per_grid")
 
-            if getattr(self.model.config, "model_type", None) in ["qwen2_5_omni_thinker", "qwen3_omni_moe_thinker", "speechlmm"]:
+            if getattr(self.model.config, "model_type", None) in [
+                "qwen2_5_omni_thinker",
+                "qwen3_omni_moe_thinker",
+                "speechlmm",
+            ]:
                 rope_index_kwargs["use_audio_in_video"] = getattr(self.processor, "use_audio_in_video", False)
                 feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
                 if feature_attention_mask is not None:  # FIXME: need to get video image lengths
@@ -256,19 +260,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                     padded_codec.append(ct + [IGNORE_INDEX] * (max_codec_len - len(ct)))
             features["codec_labels"] = torch.tensor(padded_codec, dtype=torch.long)
 
-        # create lipread batch
-        if len(batch_lipread)>0:
-            lengths= [x.shape[0] for x in features['lipread']]
+        if len(batch_lipread) > 0:
+            lengths = [x.shape[0] for x in features["lipread"]]
             max_length = max(lengths)
-            lipread_padded = torch.zeros((len(features['lipread']), max_length, 88, 88))
-            lipread_mask = torch.zeros((len(features['lipread']), max_length,max_length), dtype=torch.uint8)
+            n_lipread = len(features["lipread"])
+            lipread_padded = torch.zeros((n_lipread, max_length, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE))
+            lipread_mask = torch.zeros((len(features["lipread"]), max_length, max_length), dtype=torch.uint8)
 
-            for i in range(len(features['lipread'])):
-                lipread_padded[i, :lengths[i]] = features['lipread'][i][:,0,:,:]
-                lipread_mask[i, :lengths[i],:lengths[i]] = 1
-            
-            features['lipread'] = lipread_padded
-            features['lipread_mask'] = lipread_mask
+            for i in range(len(features["lipread"])):
+                lipread_padded[i, : lengths[i]] = features["lipread"][i][:, 0, :, :]
+                lipread_mask[i, : lengths[i], : lengths[i]] = 1
+
+            features["lipread"] = lipread_padded
+            features["lipread_mask"] = lipread_mask
         return features
 
 

@@ -81,7 +81,7 @@ class DatasetAttr:
 
         if "columns" in attr:
             column_names = ["prompt", "query", "response", "history", "messages", "system", "tools"]
-            column_names += ["images", "videos", "audios", "codec_tokens", "chosen", "rejected", "kto_tag","lipread"]
+            column_names += ["images", "videos", "audios", "codec_tokens", "chosen", "rejected", "kto_tag", "lipread"]
             for column_name in column_names:
                 self.set_attr(column_name, attr["columns"])
 

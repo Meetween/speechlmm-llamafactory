@@ -28,6 +28,7 @@ from transformers import (
 from trl import AutoModelForCausalLMWithValueHead
 
 from ..extras import logging
+from ..extras.constants import LIPREAD_BOS_TOKEN, LIPREAD_EOS_TOKEN, LIPREAD_PAD_TOKEN
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
 from .adapter import init_adapter
@@ -171,7 +172,8 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
 
         elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
-            "qwen2_5_omni", "qwen3_omni_moe",
+            "qwen2_5_omni",
+            "qwen3_omni_moe",
         ):
             from speechlmm.models import SpeechLMMForConditionalGeneration
             from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
@@ -181,15 +183,15 @@ def load_model(
             if getattr(finetuning_args, "freeze_language_model", False) and not has_trainable_adapters:
                 config_overrides["thinker_loss_weight"] = 0.0
 
-            config_overrides["lipread_bos_token_id"] = tokenizer.vocab['<|lipread_start|>']
-            config_overrides["lipread_eos_token_id"] = tokenizer.vocab['<|lipread_end|>']
-            config_overrides["lipread_pad_token_id"] = tokenizer.vocab['<|lipread_pad|>']
+            config_overrides["lipread_bos_token_id"] = tokenizer.vocab[LIPREAD_BOS_TOKEN]
+            config_overrides["lipread_eos_token_id"] = tokenizer.vocab[LIPREAD_EOS_TOKEN]
+            config_overrides["lipread_pad_token_id"] = tokenizer.vocab[LIPREAD_PAD_TOKEN]
 
             speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
             qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
             model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
             if model_args.lipreading_encoder_weights is not None:
-                model.load_autoAVSR_weights(model_args.lipreading_encoder_weights)
+                model.load_auto_avsr_weights(model_args.lipreading_encoder_weights)
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
