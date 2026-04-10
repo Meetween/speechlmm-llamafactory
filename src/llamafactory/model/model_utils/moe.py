@@ -133,8 +133,14 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
         _set_z3_leaf_modules(model, [Qwen3VLMoeTextSparseMoeBlock])
 
     if model_type in ("qwen3_omni_moe", "qwen3_omni_moe_thinker", "speechlmm"):
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerTextSparseMoeBlock
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeThinkerTextSparseMoeBlock,
+        )
 
+        # Only MoE sparse blocks need Z3 leaf treatment (routing requires all
+        # expert weights gathered).  Do NOT mark audio encoder modules as Z3
+        # leaves — they are standard transformer layers and making them leaves
+        # prevents gradients from flowing to any trainable params inside.
         _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
 
 
