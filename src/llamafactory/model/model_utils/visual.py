@@ -195,8 +195,8 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
 
         if composite.audio_model_keys:
             if composite.audio_adapter_prefixes:
-                freeze_enc = getattr(finetuning_args, "freeze_audio_encoder", True)
-                freeze_adp = getattr(finetuning_args, "freeze_audio_adapters", True)
+                freeze_enc = finetuning_args.freeze_audio_encoder
+                freeze_adp = finetuning_args.freeze_audio_adapters
                 if freeze_enc:
                     # audio_model_keys (e.g. "audio_tower") covers all sub-modules
                     # including adapters, so no need to also add adapter prefixes.
@@ -205,7 +205,7 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
                 if freeze_adp and not freeze_enc:
                     logger.info_rank0(f"Set audio adapters not trainable: {composite.audio_adapter_prefixes}.")
                     forbidden_modules.update(composite.audio_adapter_prefixes)
-            elif getattr(finetuning_args, "freeze_audio_tower", True):
+            elif finetuning_args.freeze_audio_tower:
                 logger.info_rank0(f"Set audio model not trainable: {composite.audio_model_keys}.")
                 forbidden_modules.update(composite.audio_model_keys)
 
@@ -217,31 +217,33 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
             logger.info_rank0(f"Set language model not trainable: {composite.language_model_keys}.")
             forbidden_modules.update(composite.language_model_keys)
 
-        if getattr(finetuning_args, "freeze_talker", False) and composite.talker_keys:
+        if finetuning_args.freeze_talker and composite.talker_keys:
             logger.info_rank0(f"Set talker not trainable: {composite.talker_keys}.")
             forbidden_modules.update(composite.talker_keys)
 
-        if getattr(finetuning_args, "freeze_code2wav", False) and composite.code2wav_keys:
+        if finetuning_args.freeze_code2wav and composite.code2wav_keys:
             logger.info_rank0(f"Set code2wav not trainable: {composite.code2wav_keys}.")
             forbidden_modules.update(composite.code2wav_keys)
 
-        if getattr(finetuning_args, "freeze_code_predictor", False):
+        if finetuning_args.freeze_code_predictor:
             logger.info_rank0("Set code_predictor not trainable: ['talker.code_predictor'].")
             forbidden_modules.add("talker.code_predictor")
 
-        if getattr(finetuning_args, "freeze_lipread_encoder", True) and composite.lipread_model_keys:
+        if finetuning_args.freeze_lipread_encoder and composite.lipread_model_keys:
             logger.info_rank0(f"Set lipread encoder not trainable: {composite.lipread_model_keys}.")
             forbidden_modules.update(composite.lipread_model_keys)
 
-        if getattr(finetuning_args, "freeze_lipread_adapter", True) and composite.lipread_adapter_keys:
+        if finetuning_args.freeze_lipread_adapter and composite.lipread_adapter_keys:
             logger.info_rank0(f"Set lipread adapter not trainable: {composite.lipread_adapter_keys}.")
             forbidden_modules.update(composite.lipread_adapter_keys)
 
     return forbidden_modules
 
 
-def _matches_prefix(name: str, prefixes: list[str]) -> bool:
+def _matches_prefix(name: str, prefixes: list[str] | None) -> bool:
     """Check if *name* starts with any of the given prefixes."""
+    if not prefixes:
+        return False
     return any(name == p or name.startswith(p + ".") for p in prefixes)
 
 

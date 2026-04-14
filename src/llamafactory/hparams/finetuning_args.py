@@ -712,6 +712,20 @@ class FinetuningArguments(
                 if getattr(self, f"lora_{comp}_alpha") is None:
                     setattr(self, f"lora_{comp}_alpha", self.lora_alpha)
 
+        if (
+            self.finetuning_type == "lora"
+            and not _has_component_lora
+            and self.freeze_audio_encoder
+            and not self.freeze_audio_adapters
+        ):
+            warnings.warn(
+                "freeze_audio_encoder=True with freeze_audio_adapters=False has no effect "
+                "under old-style lora_target — the 'audio_tower' prefix freezes adapters too. "
+                "Use lora_audio_adapters=True for fine-grained LoRA control.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if self.lora_audio_adapters and self.finetuning_type == "lora":
             paths = list(self.trainable_module_paths or [])
             if "audio_tower.ln_post" not in paths:

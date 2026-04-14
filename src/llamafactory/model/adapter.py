@@ -25,7 +25,7 @@ from .model_utils.ktransformers import get_kt_peft_model, load_kt_peft_model
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
 from .model_utils.unsloth import get_unsloth_peft_model, load_unsloth_peft_model
-from .model_utils.visual import COMPOSITE_MODELS, build_component_lora_targets, get_forbidden_modules, patch_target_modules
+from .model_utils.visual import COMPOSITE_MODELS, _matches_prefix, build_component_lora_targets, get_forbidden_modules, patch_target_modules
 
 
 if TYPE_CHECKING:
@@ -35,13 +35,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-def _matches_trainable_paths(name: str, paths: list[str] | None) -> bool:
-    """Check if a parameter name matches any of the trainable module path prefixes."""
-    if not paths:
-        return False
-    return any(name == p or name.startswith(p + ".") for p in paths)
 
 
 def _setup_full_tuning(
@@ -57,7 +50,7 @@ def _setup_full_tuning(
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if _matches_trainable_paths(name, trainable_paths):
+        if _matches_prefix(name, trainable_paths):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         elif not any(forbidden_module in name for forbidden_module in forbidden_modules):
@@ -141,7 +134,7 @@ def _setup_freeze_tuning(
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if _matches_trainable_paths(name, trainable_paths):
+        if _matches_prefix(name, trainable_paths):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         elif any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
@@ -366,7 +359,7 @@ def _setup_lora_tuning(
             unfrozen_count = 0
             for name, param in model.named_parameters():
                 clean_name = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
-                if _matches_trainable_paths(clean_name, trainable_paths) and not param.requires_grad:
+                if _matches_prefix(clean_name, trainable_paths) and not param.requires_grad:
                     param.requires_grad_(True)
                     unfrozen_count += 1
             if unfrozen_count > 0:
