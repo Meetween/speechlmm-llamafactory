@@ -16,6 +16,12 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from speechlmm.training.hparams import (
+    SpeechLMMComponentLoraArguments,
+    SpeechLMMFreezeArguments,
+    SpeechLMMModelArguments,
+)
+
 
 @dataclass
 class FreezeArguments:
@@ -131,70 +137,6 @@ class LoraArguments:
         default=False,
         metadata={"help": "Whether or not to create a new adapter with randomly initialized weight."},
     )
-    lora_audio_encoder: bool = field(
-        default=False,
-        metadata={"help": "Whether to apply LoRA to the audio encoder (Whisper) layers."},
-    )
-    lora_audio_encoder_rank: int | None = field(
-        default=None,
-        metadata={"help": "LoRA rank for the audio encoder. Falls back to lora_rank if not set."},
-    )
-    lora_audio_encoder_alpha: int | None = field(
-        default=None,
-        metadata={"help": "LoRA alpha for the audio encoder. Falls back to lora_alpha if not set."},
-    )
-    lora_audio_adapters: bool = field(
-        default=False,
-        metadata={"help": "Whether to apply LoRA to the audio adapter layers (proj1, proj2). ln_post is auto-added to trainable_module_paths."},
-    )
-    lora_audio_adapters_rank: int | None = field(
-        default=None,
-        metadata={"help": "LoRA rank for the audio adapters. Falls back to lora_rank if not set."},
-    )
-    lora_audio_adapters_alpha: int | None = field(
-        default=None,
-        metadata={"help": "LoRA alpha for the audio adapters. Falls back to lora_alpha if not set."},
-    )
-    lora_language_model: bool = field(
-        default=False,
-        metadata={"help": "Whether to apply LoRA to the language model (Thinker)."},
-    )
-    lora_language_model_rank: int | None = field(
-        default=None,
-        metadata={"help": "LoRA rank for the language model. Falls back to lora_rank if not set."},
-    )
-    lora_language_model_alpha: int | None = field(
-        default=None,
-        metadata={"help": "LoRA alpha for the language model. Falls back to lora_alpha if not set."},
-    )
-    lora_lipread_encoder: bool = field(
-        default=False,
-        metadata={"help": "Whether to apply LoRA to the lipread encoder layers."},
-    )
-    lora_lipread_encoder_rank: int | None = field(
-        default=None,
-        metadata={"help": "LoRA rank for the lipread encoder. Falls back to lora_rank if not set."},
-    )
-    lora_lipread_encoder_alpha: int | None = field(
-        default=None,
-        metadata={"help": "LoRA alpha for the lipread encoder. Falls back to lora_alpha if not set."},
-    )
-    lora_lipread_adapter: bool = field(
-        default=False,
-        metadata={"help": "Whether to apply LoRA to the lipread adapter layer."},
-    )
-    lora_lipread_adapter_rank: int | None = field(
-        default=None,
-        metadata={"help": "LoRA rank for the lipread adapter. Falls back to lora_rank if not set."},
-    )
-    lora_lipread_adapter_alpha: int | None = field(
-        default=None,
-        metadata={"help": "LoRA alpha for the lipread adapter. Falls back to lora_alpha if not set."},
-    )
-    # TODO: add lora_talker / lora_talker_rank / lora_talker_alpha for Talker LoRA
-    # TODO: add lora_vision_encoder / lora_vision_encoder_rank / lora_vision_encoder_alpha for vision tower LoRA
-    # TODO(low-priority): add lora_code2wav component flags if Code2Wav LoRA is ever needed
-    # TODO: add flag to include/exclude lm_head from lora_language_model targets (currently always included)
 
 
 @dataclass
@@ -517,6 +459,8 @@ class SwanLabArguments:
 
 @dataclass
 class FinetuningArguments(
+    SpeechLMMComponentLoraArguments,
+    SpeechLMMFreezeArguments,
     SwanLabArguments,
     BAdamArgument,
     ApolloArguments,
@@ -579,25 +523,7 @@ class FinetuningArguments(
     )
     freeze_audio_tower: bool = field(
         default=True,
-        metadata={"help": "Whether or not to freeze the audio tower in SpeechLMM training."},
-    )
-    freeze_audio_encoder: bool | None = field(
-        default=None,
-        metadata={
-            "help": (
-                "Whether to freeze the audio encoder (Whisper) layers. "
-                "Inherits from freeze_audio_tower if not set."
-            )
-        },
-    )
-    freeze_audio_adapters: bool | None = field(
-        default=None,
-        metadata={
-            "help": (
-                "Whether to freeze the audio adapter layers (proj1, proj2, ln_post). "
-                "Inherits from freeze_audio_tower if not set."
-            )
-        },
+        metadata={"help": "Whether or not to freeze the audio tower in MLLM training."},
     )
     freeze_multi_modal_projector: bool = field(
         default=True,
@@ -606,31 +532,6 @@ class FinetuningArguments(
     freeze_language_model: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the language model in MLLM training."},
-    )
-    freeze_talker: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to freeze the Talker (speech generation) sub-model in SpeechLMM training."},
-    )
-    freeze_code2wav: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to freeze the Code2Wav (waveform synthesis) sub-model in SpeechLMM training."},
-    )
-    freeze_code_predictor: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Whether or not to freeze the Talker's code_predictor (residual codebook predictor) "
-                "in SpeechLMM training. Only relevant when freeze_talker is False."
-            )
-        },
-    )
-    freeze_lipread_encoder: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to freeze the lipread encoder in SpeechLMM training."},
-    )
-    freeze_lipread_adapter: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to freeze the lipread adapter in SpeechLMM training."},
     )
     compute_accuracy: bool = field(
         default=False,
@@ -670,73 +571,8 @@ class FinetuningArguments(
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
 
-        # TODO: extend when adding lora_talker, lora_vision_encoder, lora_code2wav
-        _lora_components = (
-            "audio_encoder", "audio_adapters", "language_model",
-            "lipread_encoder", "lipread_adapter",
-        )
-        _has_component_lora = any(getattr(self, f"lora_{c}") for c in _lora_components)
-
-        if _has_component_lora and self.finetuning_type != "lora":
-            raise ValueError("lora_* component flags require finetuning_type='lora'.")
-
-        if _has_component_lora and self.lora_target != ["all"]:
-            warnings.warn(
-                "Both lora_* component flags and lora_target are set. "
-                "Component flags take precedence; lora_target will be ignored.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        if self.freeze_audio_encoder is None:
-            self.freeze_audio_encoder = self.freeze_audio_tower
-        if self.freeze_audio_adapters is None:
-            self.freeze_audio_adapters = self.freeze_audio_tower
-
-        # TODO: extend when adding lora_talker, lora_vision_encoder, lora_code2wav
-        _freeze_map = {
-            "audio_encoder": "freeze_audio_encoder",
-            "audio_adapters": "freeze_audio_adapters",
-            "language_model": "freeze_language_model",
-            "lipread_encoder": "freeze_lipread_encoder",
-            "lipread_adapter": "freeze_lipread_adapter",
-        }
-        for comp, freeze_attr in _freeze_map.items():
-            if getattr(self, f"lora_{comp}"):
-                setattr(self, freeze_attr, False)
-
-        for comp in _lora_components:
-            if getattr(self, f"lora_{comp}"):
-                if getattr(self, f"lora_{comp}_rank") is None:
-                    setattr(self, f"lora_{comp}_rank", self.lora_rank)
-                if getattr(self, f"lora_{comp}_alpha") is None:
-                    setattr(self, f"lora_{comp}_alpha", self.lora_alpha)
-
-        if (
-            self.finetuning_type == "lora"
-            and not _has_component_lora
-            and self.freeze_audio_encoder
-            and not self.freeze_audio_adapters
-        ):
-            warnings.warn(
-                "freeze_audio_encoder=True with freeze_audio_adapters=False has no effect "
-                "under old-style lora_target — the 'audio_tower' prefix freezes adapters too. "
-                "Use lora_audio_adapters=True for fine-grained LoRA control.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        if self.lora_audio_adapters and self.finetuning_type == "lora":
-            paths = list(self.trainable_module_paths or [])
-            if "audio_tower.ln_post" not in paths:
-                paths.append("audio_tower.ln_post")
-            self.trainable_module_paths = paths
-        elif self.finetuning_type != "lora" and not self.freeze_audio_adapters and self.freeze_audio_encoder:
-            paths = list(self.trainable_module_paths or [])
-            for prefix in ("audio_tower.proj1", "audio_tower.proj2", "audio_tower.ln_post"):
-                if prefix not in paths:
-                    paths.append(prefix)
-            self.trainable_module_paths = paths
+        self._resolve_freeze_defaults()
+        self._validate_component_lora()
 
         assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
