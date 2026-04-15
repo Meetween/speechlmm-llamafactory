@@ -74,11 +74,11 @@ def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] 
     if len(sys.argv) > 1 and (sys.argv[1].endswith(".yaml") or sys.argv[1].endswith(".yml")):
         override_config = OmegaConf.from_cli(sys.argv[2:])
         dict_config = OmegaConf.load(Path(sys.argv[1]).absolute())
-        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
+        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config), resolve=True)
     elif len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
         override_config = OmegaConf.from_cli(sys.argv[2:])
         dict_config = OmegaConf.create(json.load(Path(sys.argv[1]).absolute()))
-        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
+        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config), resolve=True)
     else:
         return sys.argv[1:]
 
