@@ -149,6 +149,10 @@ class BaseModelArguments:
         default=True,
         metadata={"help": "Whether or not to use reentrant gradient checkpointing."},
     )
+    gradient_checkpointing_all_layers: bool = field(
+        default=False,
+        metadata={"help": "Apply gradient checkpointing to all layers instead of only trainable ones (saves VRAM at the cost of extra recomputation)."},
+    )
     upcast_layernorm: bool = field(
         default=False,
         metadata={"help": "Whether or not to upcast the layernorm weights in fp32."},
