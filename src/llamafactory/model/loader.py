@@ -179,10 +179,19 @@ def load_model(
             from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
 
             config_overrides = {}
-            has_trainable_adapters = bool(getattr(finetuning_args, "trainable_module_paths", None))
-            if getattr(finetuning_args, "freeze_language_model", False) and not has_trainable_adapters:
+            has_trainable_adapters = bool(finetuning_args.trainable_module_paths)
+            has_trainable_lipread = (
+                not finetuning_args.freeze_lipread_encoder
+                or not finetuning_args.freeze_lipread_adapter
+            )
+            if (
+                finetuning_args.freeze_language_model
+                and not has_trainable_adapters
+                and not has_trainable_lipread
+            ):
                 config_overrides["thinker_loss_weight"] = 0.0
 
+            config_overrides["enable_lipread"] = has_trainable_lipread
             config_overrides["lipread_bos_token_id"] = tokenizer.vocab[LIPREAD_BOS_TOKEN]
             config_overrides["lipread_eos_token_id"] = tokenizer.vocab[LIPREAD_EOS_TOKEN]
             config_overrides["lipread_pad_token_id"] = tokenizer.vocab[LIPREAD_PAD_TOKEN]
