@@ -75,8 +75,6 @@ def _register_composite_model(
     lipread_adapter_keys: Optional[list[str]] = None,
     talker_keys: Optional[list[str]] = None,
     code2wav_keys: Optional[list[str]] = None,
-    lipread_encoder_keys: Optional[list[str]] = None,
-    lipread_adapter_keys: Optional[list[str]] = None,
 ):
     r"""Register a new composite model.
 
@@ -106,8 +104,6 @@ def _register_composite_model(
         lipread_adapter_keys=lipread_adapter_keys or [],
         talker_keys=talker_keys or [],
         code2wav_keys=code2wav_keys or [],
-        lipread_encoder_keys=lipread_encoder_keys or [],
-        lipread_adapter_keys=lipread_adapter_keys or [],
     )
 
 
