@@ -23,6 +23,8 @@ import torch
 from omegaconf import OmegaConf
 from transformers.training_args import _convert_str_dict
 
+from speechlmm.training.hparams import SpeechLMMModelArguments
+
 from ..extras.constants import AttentionFunction, EngineName, QuantizationMethod, RopeScaling
 from ..extras.logging import get_logger
 
@@ -164,10 +166,6 @@ class BaseModelArguments:
     train_from_scratch: bool = field(
         default=False,
         metadata={"help": "Whether or not to randomly initialize the model weights."},
-    )
-    use_speechlmm_wrapper: bool = field(
-        default=False,
-        metadata={"help": "Wrap a Qwen3-Omni checkpoint in the SpeechLMM model (zero-copy)."},
     )
     infer_backend: EngineName = field(
         default=EngineName.HF,
@@ -513,6 +511,7 @@ class KTransformersArguments:
 
 @dataclass
 class ModelArguments(
+    SpeechLMMModelArguments,
     SGLangArguments,
     VllmArguments,
     KTransformersArguments,
