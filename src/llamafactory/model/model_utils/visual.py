@@ -45,10 +45,13 @@ class CompositeModel:
     language_model_keys: list[str]
     lora_conflict_keys: list[str]
     audio_model_keys: list[str]
+    audio_adapter_prefixes: list[str]
+    lipread_model_keys: list[str]
+    lipread_adapter_keys: list[str]
     talker_keys: list[str]
     code2wav_keys: list[str]
-    lipread_encoder_keys: list[str]
-    lipread_adapter_keys: list[str]
+    # TODO: add talker_adapter_prefixes (for excluding code_predictor from talker LoRA)
+    # TODO: add vision_adapter_prefixes (if vision tower gets encoder/adapter split)
 
     def get_projector(self, module: "torch.nn.Module") -> "torch.nn.Module":
         for key in self.projector_key.split("."):
@@ -67,6 +70,9 @@ def _register_composite_model(
     language_model_keys: Optional[list[str]] = None,
     lora_conflict_keys: Optional[list[str]] = None,
     audio_model_keys: Optional[list[str]] = None,
+    audio_adapter_prefixes: Optional[list[str]] = None,
+    lipread_model_keys: Optional[list[str]] = None,
+    lipread_adapter_keys: Optional[list[str]] = None,
     talker_keys: Optional[list[str]] = None,
     code2wav_keys: Optional[list[str]] = None,
     lipread_encoder_keys: Optional[list[str]] = None,
@@ -81,6 +87,9 @@ def _register_composite_model(
         language_model_keys: language_model
         lora_conflict_keys: None
         audio_model_keys: audio encoder (separate from vision for independent freeze control)
+        audio_adapter_prefixes: audio adapter sub-modules (e.g. proj1, proj2, ln_post)
+        lipread_model_keys: lipread encoder sub-model
+        lipread_adapter_keys: lipread adapter sub-model
         talker_keys: speech generation sub-model (e.g. SpeechLMM's Talker)
         code2wav_keys: waveform synthesis sub-model (e.g. SpeechLMM's Code2Wav)
 
@@ -92,6 +101,9 @@ def _register_composite_model(
         language_model_keys=language_model_keys or ["language_model", "lm_head"],
         lora_conflict_keys=lora_conflict_keys or [],
         audio_model_keys=audio_model_keys or [],
+        audio_adapter_prefixes=audio_adapter_prefixes or [],
+        lipread_model_keys=lipread_model_keys or [],
+        lipread_adapter_keys=lipread_adapter_keys or [],
         talker_keys=talker_keys or [],
         code2wav_keys=code2wav_keys or [],
         lipread_encoder_keys=lipread_encoder_keys or [],
@@ -185,9 +197,21 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
             logger.info_rank0(f"Set vision model not trainable: {composite.vision_model_keys}.")
             forbidden_modules.update(composite.vision_model_keys)
 
-        if getattr(finetuning_args, "freeze_audio_tower", True) and composite.audio_model_keys:
-            logger.info_rank0(f"Set audio model not trainable: {composite.audio_model_keys}.")
-            forbidden_modules.update(composite.audio_model_keys)
+        if composite.audio_model_keys:
+            if composite.audio_adapter_prefixes:
+                freeze_enc = finetuning_args.freeze_audio_encoder
+                freeze_adp = finetuning_args.freeze_audio_adapters
+                if freeze_enc:
+                    # audio_model_keys (e.g. "audio_tower") covers all sub-modules
+                    # including adapters, so no need to also add adapter prefixes.
+                    logger.info_rank0(f"Set audio encoder not trainable: {composite.audio_model_keys}.")
+                    forbidden_modules.update(composite.audio_model_keys)
+                if freeze_adp and not freeze_enc:
+                    logger.info_rank0(f"Set audio adapters not trainable: {composite.audio_adapter_prefixes}.")
+                    forbidden_modules.update(composite.audio_adapter_prefixes)
+            elif finetuning_args.freeze_audio_tower:
+                logger.info_rank0(f"Set audio model not trainable: {composite.audio_model_keys}.")
+                forbidden_modules.update(composite.audio_model_keys)
 
         if finetuning_args.freeze_multi_modal_projector:
             logger.info_rank0(f"Set multi model projector not trainable: {composite.projector_key}.")
@@ -197,27 +221,135 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
             logger.info_rank0(f"Set language model not trainable: {composite.language_model_keys}.")
             forbidden_modules.update(composite.language_model_keys)
 
-        if getattr(finetuning_args, "freeze_talker", False) and composite.talker_keys:
+        if finetuning_args.freeze_talker and composite.talker_keys:
             logger.info_rank0(f"Set talker not trainable: {composite.talker_keys}.")
             forbidden_modules.update(composite.talker_keys)
 
-        if getattr(finetuning_args, "freeze_code2wav", False) and composite.code2wav_keys:
+        if finetuning_args.freeze_code2wav and composite.code2wav_keys:
             logger.info_rank0(f"Set code2wav not trainable: {composite.code2wav_keys}.")
             forbidden_modules.update(composite.code2wav_keys)
 
-        if getattr(finetuning_args, "freeze_code_predictor", False):
+        if finetuning_args.freeze_code_predictor:
             logger.info_rank0("Set code_predictor not trainable: ['talker.code_predictor'].")
             forbidden_modules.add("talker.code_predictor")
 
-        if getattr(finetuning_args, "freeze_lipread_encoder", False):
-            logger.info_rank0("Set lipread_encoder not trainable: ['lipread_encoder'].")
-            forbidden_modules.update(composite.lipread_encoder_keys)
+        if finetuning_args.freeze_lipread_encoder and composite.lipread_model_keys:
+            logger.info_rank0(f"Set lipread encoder not trainable: {composite.lipread_model_keys}.")
+            forbidden_modules.update(composite.lipread_model_keys)
 
-        if getattr(finetuning_args, "freeze_lipread_adapter", False):
-            logger.info_rank0("Set lipread_adapter not trainable: ['lipread_adapter'].")
+        if finetuning_args.freeze_lipread_adapter and composite.lipread_adapter_keys:
+            logger.info_rank0(f"Set lipread adapter not trainable: {composite.lipread_adapter_keys}.")
             forbidden_modules.update(composite.lipread_adapter_keys)
 
     return forbidden_modules
+
+
+def _matches_prefix(name: str, prefixes: list[str] | None) -> bool:
+    """Check if *name* starts with any of the given prefixes."""
+    if not prefixes:
+        return False
+    return any(name == p or name.startswith(p + ".") for p in prefixes)
+
+
+def build_component_lora_targets(
+    model: "PreTrainedModel",
+    finetuning_args: "FinetuningArguments",
+) -> tuple[list[str], dict[str, int], dict[str, int]]:
+    """Select LoRA targets and per-module rank/alpha from component flags.
+
+    Returns:
+        target_modules: full-path names of ``nn.Linear`` modules to wrap with LoRA.
+        rank_pattern: ``{name: rank}`` for modules whose rank differs from the global default.
+        alpha_pattern: ``{name: alpha}`` for modules whose alpha differs from the global default.
+    """
+    model_type = getattr(model.config, "model_type", None)
+    if model_type not in COMPOSITE_MODELS:
+        return [], {}, {}
+
+    composite = COMPOSITE_MODELS[model_type]
+
+    ComponentSpec = tuple[str, int, int, list[str], list[str]]
+    components: list[ComponentSpec] = []
+
+    if finetuning_args.lora_audio_encoder:
+        components.append((
+            "audio_encoder",
+            finetuning_args.lora_audio_encoder_rank,
+            finetuning_args.lora_audio_encoder_alpha,
+            composite.audio_model_keys,
+            composite.audio_adapter_prefixes,
+        ))
+
+    if finetuning_args.lora_audio_adapters:
+        components.append((
+            "audio_adapters",
+            finetuning_args.lora_audio_adapters_rank,
+            finetuning_args.lora_audio_adapters_alpha,
+            composite.audio_adapter_prefixes,
+            [],
+        ))
+
+    if finetuning_args.lora_language_model:
+        components.append((
+            "language_model",
+            finetuning_args.lora_language_model_rank,
+            finetuning_args.lora_language_model_alpha,
+            composite.language_model_keys,
+            [],
+        ))
+
+    if finetuning_args.lora_lipread_encoder:
+        components.append((
+            "lipread_encoder",
+            finetuning_args.lora_lipread_encoder_rank,
+            finetuning_args.lora_lipread_encoder_alpha,
+            composite.lipread_model_keys,
+            [],
+        ))
+
+    if finetuning_args.lora_lipread_adapter:
+        components.append((
+            "lipread_adapter",
+            finetuning_args.lora_lipread_adapter_rank,
+            finetuning_args.lora_lipread_adapter_alpha,
+            composite.lipread_adapter_keys,
+            [],
+        ))
+
+    # TODO: add lora_talker block (composite.talker_keys, exclude code_predictor heads?)
+    # TODO: add lora_vision_encoder block (composite.vision_model_keys)
+    # TODO(low-priority): add lora_code2wav block (composite.code2wav_keys)
+
+    target_modules: list[str] = []
+    rank_pattern: dict[str, int] = {}
+    alpha_pattern: dict[str, int] = {}
+
+    for comp_name, rank, alpha, include_prefixes, exclude_prefixes in components:
+        if not include_prefixes:
+            continue
+        count_before = len(target_modules)
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            if not _matches_prefix(name, include_prefixes):
+                continue
+            if exclude_prefixes and _matches_prefix(name, exclude_prefixes):
+                continue
+            target_modules.append(name)
+            if rank != finetuning_args.lora_rank:
+                rank_pattern[name] = rank
+            if alpha != finetuning_args.lora_alpha:
+                alpha_pattern[name] = alpha
+        added = len(target_modules) - count_before
+        if added == 0:
+            logger.warning_rank0(
+                f"lora_{comp_name} is enabled but no matching Linear modules found in the model. "
+                f"Check that the model actually contains modules under prefixes: {include_prefixes}."
+            )
+        else:
+            logger.info_rank0(f"lora_{comp_name}: {added} Linear modules selected (rank={rank}, alpha={alpha}).")
+
+    return target_modules, rank_pattern, alpha_pattern
 
 
 def _is_module_forbidden(name: str, freeze_modules: set[str], conflict_keys: set[str]) -> bool:
@@ -458,10 +590,14 @@ _register_composite_model(
     language_model_keys=["model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
     audio_model_keys=["audio_tower"],
+    audio_adapter_prefixes=["audio_tower.proj1", "audio_tower.proj2", "audio_tower.ln_post"],
+    lipread_model_keys=["lipread_encoder"],
+    lipread_adapter_keys=["lipread_adapter"],
     talker_keys=["talker"],
     code2wav_keys=["code2wav"],
-    lipread_encoder_keys=["lipread_encoder"],
-    lipread_adapter_keys=["lipread_adapter"],
+    # TODO: add talker_adapter_prefixes when lora_talker is implemented
+    #   (need to decide how to handle talker.code_predictor.linear_heads ModuleList)
+    # TODO: add vision_adapter_prefixes when lora_vision_encoder is implemented
 )
 
 
