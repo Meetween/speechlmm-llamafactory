@@ -18,7 +18,9 @@
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
-from ...extras.constants import IGNORE_INDEX, LIPREAD_BOS_TOKEN, LIPREAD_EOS_TOKEN, LIPREAD_PAD_TOKEN
+from speechlmm.tokens import build_speechlmm_special_tokens
+
+from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
 from ...extras.packages import is_transformers_version_greater_than
@@ -48,8 +50,7 @@ def run_sft(
 ):
     if model_args.use_speechlmm_wrapper:
         original_add_special_tokens = getattr(model_args, "add_special_tokens", None) or []
-        lipread_tokens = [LIPREAD_BOS_TOKEN, LIPREAD_PAD_TOKEN, LIPREAD_EOS_TOKEN]
-        model_args.add_special_tokens = original_add_special_tokens + lipread_tokens
+        model_args.add_special_tokens = original_add_special_tokens + build_speechlmm_special_tokens(model_args)
 
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]

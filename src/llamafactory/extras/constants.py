@@ -51,13 +51,6 @@ IGNORE_INDEX = -100
 
 IMAGE_PLACEHOLDER = os.getenv("IMAGE_PLACEHOLDER", "<image>")
 
-LIPREAD_PLACEHOLDER = "<lipread>"
-LIPREAD_BOS_TOKEN = "<|lipread_start|>"
-LIPREAD_PAD_TOKEN = "<|lipread_pad|>"
-LIPREAD_EOS_TOKEN = "<|lipread_end|>"
-LIPREAD_FRAME_SIZE = 88
-LIPREAD_FPS = 25
-
 LAYERNORM_NAMES = {"norm", "ln"}
 
 LLAMABOARD_CONFIG = "llamaboard_config.yaml"

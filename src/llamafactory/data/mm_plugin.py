@@ -34,16 +34,19 @@ from transformers.models.mllama.processing_mllama import (
 )
 from typing_extensions import override
 
-from ..extras.constants import (
-    AUDIO_PLACEHOLDER,
-    IGNORE_INDEX,
-    IMAGE_PLACEHOLDER,
+from speechlmm.tokens import (
     LIPREAD_BOS_TOKEN,
     LIPREAD_EOS_TOKEN,
     LIPREAD_FPS,
     LIPREAD_FRAME_SIZE,
     LIPREAD_PAD_TOKEN,
     LIPREAD_PLACEHOLDER,
+)
+
+from ..extras.constants import (
+    AUDIO_PLACEHOLDER,
+    IGNORE_INDEX,
+    IMAGE_PLACEHOLDER,
     VIDEO_PLACEHOLDER,
 )
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
