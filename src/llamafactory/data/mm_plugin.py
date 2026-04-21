@@ -2137,6 +2137,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
             if message.get("role") in ("assistant", "gpt"):
                 message["content"] = message["content"].replace(AUDIO_PLACEHOLDER, "")
 
+        audios = list(audios)
         input_audios = []
         for message in messages:
             if message.get("role") not in ("assistant", "gpt"):
