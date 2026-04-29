@@ -206,6 +206,14 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                     rope_index_kwargs["audio_seqlens"] = torch.zeros(
                         features["input_ids"].shape[0], dtype=torch.long
                     )
+                    print(
+                        f"[COLLATOR_DEBUG] feature_attention_mask missing!"
+                        f" mm_inputs keys={list(mm_inputs.keys())},"
+                        f" batch_size={features['input_ids'].shape[0]},"
+                        f" has_input_features={'input_features' in mm_inputs},"
+                        f" has_attention_mask={'attention_mask' in mm_inputs}",
+                        flush=True,
+                    )
 
                 features["position_ids"], rope_deltas = self.get_rope_func(**rope_index_kwargs)
                 features["rope_deltas"] = rope_deltas - (1 - rope_index_kwargs["attention_mask"]).sum(
