@@ -2073,14 +2073,15 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
             if message.get("role") in ("assistant", "gpt"):
                 message["content"] = message["content"].replace(AUDIO_PLACEHOLDER, "")
 
+        audio_iter = iter(audios)
         input_audios = []
         for message in messages:
             if message.get("role") not in ("assistant", "gpt"):
-                input_audios.extend(
-                    [audios.pop(0) for _ in range(message["content"].count(AUDIO_PLACEHOLDER))]
-                    if audios
-                    else []
-                )
+                for _ in range(message["content"].count(AUDIO_PLACEHOLDER)):
+                    try:
+                        input_audios.append(next(audio_iter))
+                    except StopIteration:
+                        break
 
         return super().process_messages(messages, images, videos, input_audios, processor)
 
