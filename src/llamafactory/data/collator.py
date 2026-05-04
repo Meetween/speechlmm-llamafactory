@@ -201,7 +201,23 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 rope_index_kwargs["use_audio_in_video"] = getattr(self.processor, "use_audio_in_video", False)
                 feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
                 if feature_attention_mask is not None:  # FIXME: need to get video image lengths
-                    audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+                    fam = feature_attention_mask
+                    bsz = features["input_ids"].shape[0]
+                    # get_rope_index indexes audio_seqlens once per audio segment across the whole batch
+                    # (global audio_idx). A [1, T] mask with bsz>1 makes sum(...) length 1 → IndexError.
+                    if fam.dim() == 2 and fam.size(0) == 1 and bsz > 1:
+                        if fam.numel() % bsz == 0:
+                            fam = fam.reshape(bsz, fam.numel() // bsz)
+                        else:
+                            inf = mm_inputs.get("input_features")
+                            if (
+                                inf is not None
+                                and inf.dim() >= 2
+                                and inf.shape[0] == bsz
+                                and fam.shape[-1] == inf.shape[-1]
+                            ):
+                                fam = fam.expand(bsz, -1)
+                    audio_feature_lengths = torch.sum(fam, dim=-1)
                     rope_index_kwargs["audio_seqlens"] = audio_feature_lengths  # prepare for input
 
                 features["position_ids"], rope_deltas = self.get_rope_func(**rope_index_kwargs)
