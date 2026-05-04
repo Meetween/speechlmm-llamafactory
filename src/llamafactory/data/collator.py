@@ -200,12 +200,9 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             if getattr(self.model.config, "model_type", None) in ["qwen2_5_omni_thinker", "qwen3_omni_moe_thinker", "speechlmm"]:
                 rope_index_kwargs["use_audio_in_video"] = getattr(self.processor, "use_audio_in_video", False)
                 feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
-                if feature_attention_mask is not None:
-                    rope_index_kwargs["audio_seqlens"] = torch.sum(feature_attention_mask, dim=1)
-                else:
-                    rope_index_kwargs["audio_seqlens"] = torch.zeros(
-                        features["input_ids"].shape[0], dtype=torch.long
-                    )
+                if feature_attention_mask is not None:  # FIXME: need to get video image lengths
+                    audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+                    rope_index_kwargs["audio_seqlens"] = audio_feature_lengths  # prepare for input
 
                 features["position_ids"], rope_deltas = self.get_rope_func(**rope_index_kwargs)
                 features["rope_deltas"] = rope_deltas - (1 - rope_index_kwargs["attention_mask"]).sum(
