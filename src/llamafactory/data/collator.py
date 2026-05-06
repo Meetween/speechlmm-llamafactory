@@ -157,6 +157,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if isinstance(self.model, PeftModel):
             self.model = self.model.base_model.model
 
+        if self.model is not None:
+            _cfg = getattr(self.model, "config", None)
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[COLLATOR_INIT] model_class=%s model_type=%s "
+                "audio_start_token_id=%s audio_end_token_id=%s audio_token_id=%s",
+                type(self.model).__name__,
+                getattr(_cfg, "model_type", "?"),
+                getattr(_cfg, "audio_start_token_id", "?"),
+                getattr(_cfg, "audio_end_token_id", "?"),
+                getattr(_cfg, "audio_token_id", "?"),
+            )
+
         if self.model is not None and hasattr(self.model, "get_rope_index"):  # for qwen2vl mrope
             self.get_rope_func = self.model.get_rope_index  # transformers < 4.52.0 or qwen2.5 omni
         elif self.model is not None and hasattr(self.model, "model") and hasattr(self.model.model, "get_rope_index"):
