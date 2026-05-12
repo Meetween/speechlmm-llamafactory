@@ -50,6 +50,16 @@ class FreezeArguments:
             )
         },
     )
+    trainable_module_paths: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Module path prefixes to keep trainable even when their parent is frozen. "
+                "Overrides freeze_* flags for matching parameters. "
+                "Use commas to separate multiple paths (e.g. audio_tower.proj1,visual.merger)."
+            )
+        },
+    )
 
 
 @dataclass
@@ -500,7 +510,11 @@ class FinetuningArguments(
     )
     freeze_vision_tower: bool = field(
         default=True,
-        metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
+        metadata={"help": "Whether or not to freeze the vision tower in MLLM training."},
+    )
+    freeze_audio_tower: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the audio tower in SpeechLMM training."},
     )
     freeze_multi_modal_projector: bool = field(
         default=True,
@@ -509,6 +523,23 @@ class FinetuningArguments(
     freeze_language_model: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the language model in MLLM training."},
+    )
+    freeze_talker: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the Talker (speech generation) sub-model in SpeechLMM training."},
+    )
+    freeze_code2wav: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to freeze the Code2Wav (waveform synthesis) sub-model in SpeechLMM training."},
+    )
+    freeze_code_predictor: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether or not to freeze the Talker's code_predictor (residual codebook predictor) "
+                "in SpeechLMM training. Only relevant when freeze_talker is False."
+            )
+        },
     )
     compute_accuracy: bool = field(
         default=False,
@@ -539,6 +570,7 @@ class FinetuningArguments(
 
         self.freeze_trainable_modules: list[str] = split_arg(self.freeze_trainable_modules)
         self.freeze_extra_modules: list[str] | None = split_arg(self.freeze_extra_modules)
+        self.trainable_module_paths: list[str] | None = split_arg(self.trainable_module_paths)
         self.lora_alpha: int = self.lora_alpha or self.lora_rank * 2
         self.lora_target: list[str] = split_arg(self.lora_target)
         self.oft_target: list[str] = split_arg(self.oft_target)

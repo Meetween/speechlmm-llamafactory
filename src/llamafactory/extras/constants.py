@@ -2856,6 +2856,17 @@ register_model_group(
 
 register_model_group(
     models={
+        "SpeechLMM-Qwen3-Omni-30B-A3B-Instruct": {
+            DownloadSource.DEFAULT: "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        },
+    },
+    template="speechlmm",
+    multimodal=True,
+)
+
+
+register_model_group(
+    models={
         "Qwen2-VL-2B": {
             DownloadSource.DEFAULT: "Qwen/Qwen2-VL-2B",
             DownloadSource.MODELSCOPE: "Qwen/Qwen2-VL-2B",

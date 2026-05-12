@@ -1,0 +1,33 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "dev",
+    "feature/add-lipread",
+    "feature/avspeakd-achapt",
+    "feature/lora-component-config",
+    "feature/lora-encoders",
+    "fix/torchrun-path-spaces",
+    "fix/training",
+    "main"
+  ],
+  "parent": {
+    "dev": "main",
+    "feature/add-lipread": "main",
+    "feature/avspeakd-achapt": "main",
+    "feature/lora-component-config": "main",
+    "feature/lora-encoders": "main",
+    "fix/torchrun-path-spaces": "main",
+    "fix/training": "main",
+    "main": null
+  },
+  "order": [
+    "main",
+    "dev",
+    "feature/add-lipread",
+    "feature/avspeakd-achapt",
+    "feature/lora-component-config",
+    "feature/lora-encoders",
+    "fix/torchrun-path-spaces",
+    "fix/training"
+  ]
+}

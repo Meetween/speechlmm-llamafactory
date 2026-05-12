@@ -68,6 +68,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
             self.model_accepts_loss_kwargs = False
 
+        # find_labels() auto-detects all *label* params (e.g. codec_labels),
+        # but only "labels" is guaranteed present in every batch.
+        self.label_names = ["labels"]
+
         self.finetuning_args = finetuning_args
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287

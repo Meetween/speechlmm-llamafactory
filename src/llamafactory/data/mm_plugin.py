@@ -2040,6 +2040,52 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
 
 @dataclass
+class SpeechLMMPlugin(Qwen2OmniPlugin):
+    """Plugin for SpeechLMM: handles input audio (mel features) and output
+    audio (codec tokens) for joint Thinker + Talker training.
+
+    Differences from Qwen2OmniPlugin:
+    - Assistant-turn ``<audio>`` placeholders are stripped (the original
+      Qwen3-Omni Thinker never generates these tokens). Target codec tokens
+      are supplied separately via the ``codec_tokens`` / ``codec_labels`` field.
+    - User-turn ``<audio>`` tokens are processed normally (mel features).
+    """
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> list[dict[str, str]]:
+        """Process messages, distinguishing input audio (user turns) from
+        output audio (assistant turns).
+
+        - User-turn ``<audio>`` → expanded into mel-feature placeholder tokens
+          (delegated to the parent Qwen2OmniPlugin).
+        - Assistant-turn ``<audio>`` → replaced with TTS boundary tokens.
+          Codec labels are supplied separately via the ``codec_tokens`` field.
+        """
+        messages = deepcopy(messages)
+        for message in messages:
+            if message.get("role") in ("assistant", "gpt"):
+                message["content"] = message["content"].replace(AUDIO_PLACEHOLDER, "")
+
+        input_audios = []
+        for message in messages:
+            if message.get("role") not in ("assistant", "gpt"):
+                input_audios.extend(
+                    [audios.pop(0) for _ in range(message["content"].count(AUDIO_PLACEHOLDER))]
+                    if audios
+                    else []
+                )
+
+        return super().process_messages(messages, images, videos, input_audios, processor)
+
+
+@dataclass
 class VideoLlavaPlugin(BasePlugin):
     @override
     def process_messages(
@@ -2213,6 +2259,7 @@ PLUGINS = {
     "qwen2_audio": Qwen2AudioPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,
+    "speechlmm": SpeechLMMPlugin,
     "qwen3_vl": Qwen3VLPlugin,
     "video_llava": VideoLlavaPlugin,
     "youtu_vl": YoutuVLPlugin,

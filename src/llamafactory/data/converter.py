@@ -127,6 +127,7 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_codec_tokens": example[self.dataset_attr.codec_tokens] if self.dataset_attr.codec_tokens else None,
         }
         return output
 
@@ -223,6 +224,7 @@ class SharegptDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_codec_tokens": example[self.dataset_attr.codec_tokens] if self.dataset_attr.codec_tokens else None,
         }
         return output
 
@@ -363,6 +365,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_codec_tokens": example[self.dataset_attr.codec_tokens] if self.dataset_attr.codec_tokens else None,
         }
         return output
 
@@ -406,6 +409,7 @@ def align_dataset(
     _images: []
     _videos: []
     _audios: []
+    _codec_tokens: [] | None
     """
     column_names = list(next(iter(dataset)).keys())
     kwargs = {}
