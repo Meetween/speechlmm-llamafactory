@@ -108,10 +108,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        batch_codec_tokens: list[list[int] | None] = []
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+            codec_tokens = feature.pop("codec_tokens", None)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
@@ -119,6 +121,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
             batch_input_ids.append(feature["input_ids"])
+            batch_codec_tokens.append(codec_tokens)
 
         fake_input_ids = []
         if (
@@ -194,7 +197,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             elif "video_second_per_grid" in mm_inputs:  # for qwen2.5 omni
                 rope_index_kwargs["second_per_grids"] = mm_inputs.get("video_second_per_grid")
 
-            if getattr(self.model.config, "model_type", None) in ["qwen2_5_omni_thinker", "qwen3_omni_moe_thinker"]:
+            if getattr(self.model.config, "model_type", None) in ["qwen2_5_omni_thinker", "qwen3_omni_moe_thinker", "speechlmm"]:
                 rope_index_kwargs["use_audio_in_video"] = getattr(self.processor, "use_audio_in_video", False)
                 feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
                 if feature_attention_mask is not None:  # FIXME: need to get video image lengths
@@ -220,6 +223,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 "qwen3_omni_moe_thinker",
                 "qwen3_vl",
                 "qwen3_vl_moe",
+                "speechlmm",
             ]
             and ("position_ids" not in features or features["position_ids"].dim() != 3)
         ):
@@ -237,6 +241,17 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             bsz, seq_length = features["input_ids"].shape
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
             return {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+
+        has_codec = any(ct is not None for ct in batch_codec_tokens)
+        if has_codec:
+            max_codec_len = max(len(ct) for ct in batch_codec_tokens if ct is not None)
+            padded_codec = []
+            for ct in batch_codec_tokens:
+                if ct is None:
+                    padded_codec.append([IGNORE_INDEX] * max_codec_len)
+                else:
+                    padded_codec.append(ct + [IGNORE_INDEX] * (max_codec_len - len(ct)))
+            features["codec_labels"] = torch.tensor(padded_codec, dtype=torch.long)
 
         return features
 

@@ -177,7 +177,7 @@ def patch_config(
             "pip install git+https://github.com/huggingface/transformers.git@3c2517727ce28a30f5044e01663ee204deb1cdbe"
         )
 
-    if getattr(config, "model_type", None) == "qwen3_omni_moe":
+    if getattr(config, "model_type", None) in ("qwen3_omni_moe", "speechlmm"):
         patch_qwen3_omni_moe_thinker_text_sparse_moe_block()
 
     # deepspeed zero3 is not compatible with low_cpu_mem_usage

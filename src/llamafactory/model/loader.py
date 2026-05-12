@@ -162,6 +162,27 @@ def load_model(
 
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
+        elif getattr(config, "model_type", None) == "speechlmm":
+            from speechlmm.models import SpeechLMMForConditionalGeneration
+
+            if model_args.train_from_scratch:
+                model = SpeechLMMForConditionalGeneration._from_config(config)
+            else:
+                model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
+
+        elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
+            "qwen2_5_omni", "qwen3_omni_moe",
+        ):
+            from speechlmm.models import SpeechLMMForConditionalGeneration
+            from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
+
+            config_overrides = {}
+            has_trainable_adapters = bool(getattr(finetuning_args, "trainable_module_paths", None))
+            if getattr(finetuning_args, "freeze_language_model", False) and not has_trainable_adapters:
+                config_overrides["thinker_loss_weight"] = 0.0
+            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
+            qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+            model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText

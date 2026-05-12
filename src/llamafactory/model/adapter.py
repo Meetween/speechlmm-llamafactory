@@ -37,6 +37,13 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _matches_trainable_paths(name: str, paths: list[str] | None) -> bool:
+    """Check if a parameter name matches any of the trainable module path prefixes."""
+    if not paths:
+        return False
+    return any(name == p or name.startswith(p + ".") for p in paths)
+
+
 def _setup_full_tuning(
     model: "PreTrainedModel",
     finetuning_args: "FinetuningArguments",
@@ -47,9 +54,13 @@ def _setup_full_tuning(
         return
 
     logger.info_rank0("Fine-tuning method: Full")
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if not any(forbidden_module in name for forbidden_module in forbidden_modules):
+        if _matches_trainable_paths(name, trainable_paths):
+            if cast_trainable_params_to_fp32:
+                param.data = param.data.to(torch.float32)
+        elif not any(forbidden_module in name for forbidden_module in forbidden_modules):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         else:
@@ -127,9 +138,13 @@ def _setup_freeze_tuning(
     if not finetuning_args.freeze_multi_modal_projector and model_type in COMPOSITE_MODELS:
         trainable_layers.append(COMPOSITE_MODELS[model_type].projector_key)
 
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
+        if _matches_trainable_paths(name, trainable_paths):
+            if cast_trainable_params_to_fp32:
+                param.data = param.data.to(torch.float32)
+        elif any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
             forbidden_module in name for forbidden_module in forbidden_modules
         ):
             if cast_trainable_params_to_fp32:
@@ -213,7 +228,9 @@ def _setup_lora_tuning(
 
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+            target_modules = find_all_linear_modules(
+                model, finetuning_args.freeze_vision_tower, finetuning_args.freeze_audio_tower
+            )
         else:
             target_modules = finetuning_args.lora_target
 
@@ -239,7 +256,13 @@ def _setup_lora_tuning(
         ):
             raise ValueError("DoRA is not compatible with PTQ-quantized models.")
 
-        if model_args.resize_vocab and finetuning_args.additional_target is None:
+        modules_to_save = finetuning_args.additional_target
+        trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
+        if trainable_paths and is_deepspeed_zero3_enabled() and modules_to_save:
+            logger.warning_rank0("Dropping modules_to_save (incompatible with ZeRO-3); using trainable_module_paths.")
+            modules_to_save = None
+
+        if model_args.resize_vocab and modules_to_save is None and not trainable_paths:
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
             module_names = set()
@@ -247,7 +270,7 @@ def _setup_lora_tuning(
                 if module in [input_embeddings, output_embeddings]:
                     module_names.add(name.split(".")[-1])
 
-            finetuning_args.additional_target = module_names
+            modules_to_save = list(module_names)
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
         if finetuning_args.finetuning_type == "lora":
@@ -258,7 +281,7 @@ def _setup_lora_tuning(
                 "lora_dropout": finetuning_args.lora_dropout,
                 "use_rslora": finetuning_args.use_rslora,
                 "use_dora": finetuning_args.use_dora,
-                "modules_to_save": finetuning_args.additional_target,
+                "modules_to_save": modules_to_save,
             }
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
@@ -266,7 +289,7 @@ def _setup_lora_tuning(
                 "oft_block_size": finetuning_args.oft_block_size,
                 "target_modules": target_modules,
                 "module_dropout": finetuning_args.module_dropout,
-                "modules_to_save": finetuning_args.additional_target,
+                "modules_to_save": modules_to_save,
             }
 
         if model_args.use_kt:
@@ -310,6 +333,16 @@ def _setup_lora_tuning(
                     **peft_kwargs,
                 )
             model = get_peft_model(model, peft_config)
+
+        if trainable_paths:
+            unfrozen_count = 0
+            for name, param in model.named_parameters():
+                clean_name = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+                if _matches_trainable_paths(clean_name, trainable_paths) and not param.requires_grad:
+                    param.requires_grad_(True)
+                    unfrozen_count += 1
+            if unfrozen_count > 0:
+                logger.info_rank0(f"Unfroze {unfrozen_count} params via trainable_module_paths.")
 
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):

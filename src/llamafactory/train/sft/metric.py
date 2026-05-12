@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -58,16 +58,52 @@ def eval_logit_processor(logits: "torch.Tensor", labels: "torch.Tensor") -> "tor
     return torch.argmax(logits, dim=-1)
 
 
+def _levenshtein(ref: list, hyp: list) -> int:
+    """Levenshtein edit distance between two sequences."""
+    n, m = len(ref), len(hyp)
+    dp = list(range(m + 1))
+    for i in range(1, n + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, m + 1):
+            temp = dp[j]
+            if ref[i - 1] == hyp[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[m]
+
+
 @dataclass
 class ComputeAccuracy:
-    r"""Compute accuracy and support `batch_eval_metrics`."""
+    r"""Compute accuracy and corpus-level WER/CER, supporting `batch_eval_metrics`."""
+
+    tokenizer: Optional["PreTrainedTokenizer"] = field(default=None, repr=False)
 
     def _dump(self) -> Optional[dict[str, float]]:
         result = None
         if hasattr(self, "score_dict"):
-            result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
+            result = {k: float(np.mean(v)) for k, v in self.score_dict.items() if v}
+            if self._ref_texts:
+                try:
+                    from jiwer import cer, wer
 
-        self.score_dict = {"accuracy": []}
+                    result["wer"] = float(wer(self._ref_texts, self._pred_texts))
+                    result["cer"] = float(cer(self._ref_texts, self._pred_texts))
+                except ImportError:
+                    total_w_edits = total_w_ref = total_c_edits = total_c_ref = 0
+                    for ref, hyp in zip(self._ref_texts, self._pred_texts):
+                        rw, hw = ref.split(), hyp.split()
+                        total_w_ref += len(rw)
+                        total_w_edits += _levenshtein(rw, hw)
+                        total_c_ref += len(ref)
+                        total_c_edits += _levenshtein(list(ref), list(hyp))
+                    result["wer"] = total_w_edits / max(total_w_ref, 1)
+                    result["cer"] = total_c_edits / max(total_c_ref, 1)
+
+        self.score_dict: dict[str, list[float]] = {"accuracy": []}
+        self._ref_texts: list[str] = []
+        self._pred_texts: list[str] = []
         return result
 
     def __post_init__(self):
@@ -79,6 +115,13 @@ class ComputeAccuracy:
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
             self.score_dict["accuracy"].append(np.mean(pred[label_mask] == label[label_mask]))
+
+            if self.tokenizer is not None:
+                pred_text = self.tokenizer.decode(pred[label_mask], skip_special_tokens=True)
+                label_text = self.tokenizer.decode(label[label_mask], skip_special_tokens=True)
+                if label_text.strip():
+                    self._ref_texts.append(label_text)
+                    self._pred_texts.append(pred_text)
 
         if compute_result:
             return self._dump()
