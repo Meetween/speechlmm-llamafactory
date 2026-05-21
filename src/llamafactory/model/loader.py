@@ -126,6 +126,8 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
 def load_config(model_args: "ModelArguments") -> "PretrainedConfig":
     r"""Load model config."""
     init_kwargs = _get_init_kwargs(model_args)
+    import speechlmm.models  # noqa: F401 — registers SpeechLMMConfig with AutoConfig
+
     return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
 
 
