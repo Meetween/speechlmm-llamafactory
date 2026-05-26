@@ -202,7 +202,8 @@ def load_model(
             speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
             qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
             model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
-            model.load_auto_avsr_weights(model_args.lipread_encoder_weights)
+            if lipread_encoder_weights is not None:
+                model.load_auto_avsr_weights(lipread_encoder_weights)
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
@@ -228,6 +229,11 @@ def load_model(
         register_autoclass(config, model, tokenizer)
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
+
+    # PEFT can reset lipread encoder weights (incl. BN running stats); reload after adapters.
+    lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
+    if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
+        model.load_auto_avsr_weights(lipread_weights)
 
     if add_valuehead:
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
