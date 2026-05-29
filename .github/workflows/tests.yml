@@ -74,17 +74,6 @@ jobs:
           uv pip install -e .
           uv pip install -r requirements/dev.txt
 
-      - name: Checkout speechlmm-v2
-        uses: actions/checkout@v6
-        with:
-          repository: Meetween/speechlmm-v2
-          # Match PR source branch (e.g. dev); on push to main use main (not dev).
-          ref: ${{ github.head_ref || github.ref_name }}
-          path: speechlmm-v2
-
-      - name: Install speechlmm package
-        run: uv pip install --no-deps -e speechlmm-v2
-
       - name: Install transformers
         if: ${{ matrix.transformers }}
         run: |

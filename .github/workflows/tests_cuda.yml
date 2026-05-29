@@ -62,16 +62,6 @@ jobs:
           uv pip install -e .
           uv pip install -r requirements/dev.txt
 
-      - name: Checkout speechlmm-v2
-        uses: actions/checkout@v6
-        with:
-          repository: Meetween/speechlmm-v2
-          ref: ${{ github.head_ref || github.ref_name }}
-          path: speechlmm-v2
-
-      - name: Install speechlmm package
-        run: uv pip install --no-deps -e speechlmm-v2
-
       - name: Check quality
         run: |
           make style && make quality
