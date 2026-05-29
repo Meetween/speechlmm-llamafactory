@@ -38,6 +38,65 @@ if TYPE_CHECKING:
     from .template import Template
 
 
+def _invert_feat_extract_output_length(output_len: int, forward_fn) -> int:
+    r"""Binary-search the raw feature length whose forward mapping equals `output_len`."""
+    if output_len <= 0:
+        return 0
+    lo, hi = 0, output_len * 32 + 500_000
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if int(forward_fn(mid)) < output_len:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _audio_seqlens_from_input_ids(
+    input_ids: "torch.Tensor",
+    attention_mask: "torch.Tensor",
+    config: Any,
+) -> "torch.Tensor | None":
+    r"""Derive `audio_seqlens` (raw feature lengths) from `input_ids`, aligned with `get_rope_index`.
+
+    Counts `<|audio_pad|>` tokens between each `<|audio_start|>`/`<|audio_end|>` pair,
+    then inverts through the same `_get_feat_extract_output_lengths` that `get_rope_index`
+    uses, so alignment is guaranteed by construction.
+    """
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        _get_feat_extract_output_lengths,
+    )
+
+    audio_start_id = getattr(config, "audio_start_token_id", None)
+    audio_token_id = getattr(config, "audio_token_id", None)
+    thinker = getattr(config, "thinker_config", None)
+    audio_end_id = getattr(config, "audio_end_token_id", None) or (
+        getattr(thinker, "audio_end_token_id", None) if thinker else None
+    )
+    if audio_start_id is None or audio_end_id is None or audio_token_id is None:
+        return None
+
+    seqlens: list[int] = []
+    for i in range(input_ids.size(0)):
+        row_mask = attention_mask[i].eq(1)
+        ids = input_ids[i][row_mask]
+        if ids.numel() == 0:
+            continue
+        starts = (ids == audio_start_id).nonzero(as_tuple=False).flatten()
+        ends = (ids == audio_end_id).nonzero(as_tuple=False).flatten()
+        if starts.numel() == 0:
+            continue
+        if starts.numel() != ends.numel():
+            return None
+        for j in range(starts.numel()):
+            si, ei = int(starts[j].item()), int(ends[j].item())
+            n_tokens = int((ids[si + 1 : ei] == audio_token_id).sum().item()) if ei > si + 1 else 0
+            seqlens.append(_invert_feat_extract_output_length(n_tokens, _get_feat_extract_output_lengths))
+    if not seqlens:
+        return None
+    return torch.tensor(seqlens, device=input_ids.device, dtype=torch.long)
+
+
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
     r"""Expand 2d attention mask to 4d attention mask.
 
@@ -197,12 +256,23 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             elif "video_second_per_grid" in mm_inputs:  # for qwen2.5 omni
                 rope_index_kwargs["second_per_grids"] = mm_inputs.get("video_second_per_grid")
 
-            if getattr(self.model.config, "model_type", None) in ["qwen2_5_omni_thinker", "qwen3_omni_moe_thinker", "speechlmm"]:
+            if getattr(self.model.config, "model_type", None) in [
+                "qwen2_5_omni_thinker",
+                "qwen3_omni_moe_thinker",
+                "speechlmm",
+            ]:
                 rope_index_kwargs["use_audio_in_video"] = getattr(self.processor, "use_audio_in_video", False)
-                feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
-                if feature_attention_mask is not None:  # FIXME: need to get video image lengths
-                    audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-                    rope_index_kwargs["audio_seqlens"] = audio_feature_lengths  # prepare for input
+                audio_seqlens = _audio_seqlens_from_input_ids(
+                    features["input_ids"],
+                    rope_index_kwargs["attention_mask"],
+                    self.model.config,
+                )
+                if audio_seqlens is None:
+                    feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
+                    if feature_attention_mask is not None:
+                        audio_seqlens = torch.sum(feature_attention_mask, dim=-1)
+                if audio_seqlens is not None:
+                    rope_index_kwargs["audio_seqlens"] = audio_seqlens
 
                 features["position_ids"], rope_deltas = self.get_rope_func(**rope_index_kwargs)
                 features["rope_deltas"] = rope_deltas - (1 - rope_index_kwargs["attention_mask"]).sum(

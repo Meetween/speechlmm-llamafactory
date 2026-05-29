@@ -126,6 +126,8 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
 def load_config(model_args: "ModelArguments") -> "PretrainedConfig":
     r"""Load model config."""
     init_kwargs = _get_init_kwargs(model_args)
+    import speechlmm.models  # noqa: F401 — registers SpeechLMMConfig with AutoConfig
+
     return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
 
 
@@ -171,7 +173,8 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
 
         elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
-            "qwen2_5_omni", "qwen3_omni_moe",
+            "qwen2_5_omni",
+            "qwen3_omni_moe",
         ):
             from speechlmm.models import SpeechLMMForConditionalGeneration
             from speechlmm.models.configuration_speechlmm import SpeechLMMConfig

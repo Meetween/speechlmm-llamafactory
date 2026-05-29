@@ -2041,8 +2041,9 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
 @dataclass
 class SpeechLMMPlugin(Qwen2OmniPlugin):
-    """Plugin for SpeechLMM: handles input audio (mel features) and output
-    audio (codec tokens) for joint Thinker + Talker training.
+    """Plugin for SpeechLMM: handles input audio (mel features) and output audio.
+
+    Handles codec tokens for joint Thinker + Talker training.
 
     Differences from Qwen2OmniPlugin:
     - Assistant-turn ``<audio>`` placeholders are stripped (the original
@@ -2060,8 +2061,9 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
-        """Process messages, distinguishing input audio (user turns) from
-        output audio (assistant turns).
+        """Process messages for input vs output audio.
+
+        Distinguishes user-turn input audio from assistant-turn output audio.
 
         - User-turn ``<audio>`` → expanded into mel-feature placeholder tokens
           (delegated to the parent Qwen2OmniPlugin).
@@ -2073,14 +2075,15 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
             if message.get("role") in ("assistant", "gpt"):
                 message["content"] = message["content"].replace(AUDIO_PLACEHOLDER, "")
 
+        audio_iter = iter(audios)
         input_audios = []
         for message in messages:
             if message.get("role") not in ("assistant", "gpt"):
-                input_audios.extend(
-                    [audios.pop(0) for _ in range(message["content"].count(AUDIO_PLACEHOLDER))]
-                    if audios
-                    else []
-                )
+                for _ in range(message["content"].count(AUDIO_PLACEHOLDER)):
+                    try:
+                        input_audios.append(next(audio_iter))
+                    except StopIteration:
+                        break
 
         return super().process_messages(messages, images, videos, input_audios, processor)
 

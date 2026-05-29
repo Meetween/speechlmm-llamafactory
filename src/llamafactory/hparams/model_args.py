@@ -21,6 +21,7 @@ from typing import Any, Literal, Self
 
 import torch
 from omegaconf import OmegaConf
+from speechlmm.training.hparams import SpeechLMMModelArguments
 from transformers.training_args import _convert_str_dict
 
 from ..extras.constants import AttentionFunction, EngineName, QuantizationMethod, RopeScaling
@@ -149,6 +150,12 @@ class BaseModelArguments:
         default=True,
         metadata={"help": "Whether or not to use reentrant gradient checkpointing."},
     )
+    gradient_checkpointing_all_layers: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply gradient checkpointing to all layers instead of only trainable ones (saves VRAM at the cost of extra recomputation)."
+        },
+    )
     upcast_layernorm: bool = field(
         default=False,
         metadata={"help": "Whether or not to upcast the layernorm weights in fp32."},
@@ -160,10 +167,6 @@ class BaseModelArguments:
     train_from_scratch: bool = field(
         default=False,
         metadata={"help": "Whether or not to randomly initialize the model weights."},
-    )
-    use_speechlmm_wrapper: bool = field(
-        default=False,
-        metadata={"help": "Wrap a Qwen3-Omni checkpoint in the SpeechLMM model (zero-copy)."},
     )
     infer_backend: EngineName = field(
         default=EngineName.HF,
@@ -509,6 +512,7 @@ class KTransformersArguments:
 
 @dataclass
 class ModelArguments(
+    SpeechLMMModelArguments,
     SGLangArguments,
     VllmArguments,
     KTransformersArguments,

@@ -15,6 +15,11 @@
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from speechlmm.training.hparams import (
+    SpeechLMMComponentLoraArguments,
+    SpeechLMMFreezeArguments,
+)
+
 
 @dataclass
 class FreezeArguments:
@@ -452,6 +457,8 @@ class SwanLabArguments:
 
 @dataclass
 class FinetuningArguments(
+    SpeechLMMComponentLoraArguments,
+    SpeechLMMFreezeArguments,
     SwanLabArguments,
     BAdamArgument,
     ApolloArguments,
@@ -514,7 +521,7 @@ class FinetuningArguments(
     )
     freeze_audio_tower: bool = field(
         default=True,
-        metadata={"help": "Whether or not to freeze the audio tower in SpeechLMM training."},
+        metadata={"help": "Whether or not to freeze the audio tower in MLLM training."},
     )
     freeze_multi_modal_projector: bool = field(
         default=True,
@@ -523,23 +530,6 @@ class FinetuningArguments(
     freeze_language_model: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the language model in MLLM training."},
-    )
-    freeze_talker: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to freeze the Talker (speech generation) sub-model in SpeechLMM training."},
-    )
-    freeze_code2wav: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to freeze the Code2Wav (waveform synthesis) sub-model in SpeechLMM training."},
-    )
-    freeze_code_predictor: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Whether or not to freeze the Talker's code_predictor (residual codebook predictor) "
-                "in SpeechLMM training. Only relevant when freeze_talker is False."
-            )
-        },
     )
     compute_accuracy: bool = field(
         default=False,
@@ -578,6 +568,9 @@ class FinetuningArguments(
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
+
+        self._resolve_freeze_defaults()
+        self._validate_component_lora()
 
         assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."

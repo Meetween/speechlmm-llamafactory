@@ -25,7 +25,13 @@ from .model_utils.ktransformers import get_kt_peft_model, load_kt_peft_model
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
 from .model_utils.unsloth import get_unsloth_peft_model, load_unsloth_peft_model
-from .model_utils.visual import COMPOSITE_MODELS, get_forbidden_modules, patch_target_modules
+from .model_utils.visual import (
+    COMPOSITE_MODELS,
+    _matches_prefix,
+    build_component_lora_targets,
+    get_forbidden_modules,
+    patch_target_modules,
+)
 
 
 if TYPE_CHECKING:
@@ -35,13 +41,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-def _matches_trainable_paths(name: str, paths: list[str] | None) -> bool:
-    """Check if a parameter name matches any of the trainable module path prefixes."""
-    if not paths:
-        return False
-    return any(name == p or name.startswith(p + ".") for p in paths)
 
 
 def _setup_full_tuning(
@@ -57,7 +56,7 @@ def _setup_full_tuning(
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if _matches_trainable_paths(name, trainable_paths):
+        if _matches_prefix(name, trainable_paths):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         elif not any(forbidden_module in name for forbidden_module in forbidden_modules):
@@ -141,7 +140,7 @@ def _setup_freeze_tuning(
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if _matches_trainable_paths(name, trainable_paths):
+        if _matches_prefix(name, trainable_paths):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         elif any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
@@ -227,27 +226,54 @@ def _setup_lora_tuning(
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
-        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(
-                model, finetuning_args.freeze_vision_tower, finetuning_args.freeze_audio_tower
-            )
+        # TODO: extend when adding lora_talker, lora_vision_encoder, lora_code2wav
+        _component_flags = (
+            "lora_audio_encoder",
+            "lora_audio_adapters",
+            "lora_language_model",
+            "lora_lipread_encoder",
+            "lora_lipread_adapter",
+        )
+        has_component_lora = any(getattr(finetuning_args, f, False) for f in _component_flags)
+
+        if has_component_lora:
+            target_module_list, rank_pattern, alpha_pattern = build_component_lora_targets(model, finetuning_args)
+            if not target_module_list:
+                raise ValueError(
+                    "Component LoRA flags are set but no matching Linear modules were found. "
+                    "Check that the model type supports component-based LoRA configuration."
+                )
+            logger.info_rank0(f"Component LoRA: {len(target_module_list)} target modules selected.")
+            # FIXME: PEFT's list-mode matching uses suffix matching (key.endswith),
+            # which causes false positives (e.g. "model.layers.0.q_proj" also matches
+            # "talker.model.layers.0.q_proj"). Passing as a regex string triggers
+            # re.fullmatch instead, giving exact matching. Remove this workaround if
+            # PEFT adds native exact-match support for target_modules lists.
+            target_modules = "|".join(re.escape(n) for n in target_module_list)
         else:
-            target_modules = finetuning_args.lora_target
+            if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+                target_modules = find_all_linear_modules(
+                    model, finetuning_args.freeze_vision_tower, finetuning_args.freeze_audio_tower
+                )
+            else:
+                target_modules = finetuning_args.lora_target
 
-        if model_args.use_kt:
-            new_list = []
-            for m in target_modules:
-                if m in ("down_proj", "up_proj", "gate_proj"):
-                    new_list.extend([f"mlp.{m}", f"shared_experts.{m}"])
-                elif m not in ("generate_linear", "orig_module", "prefill_linear"):
-                    new_list.append(m)
+            if model_args.use_kt:
+                new_list = []
+                for m in target_modules:
+                    if m in ("down_proj", "up_proj", "gate_proj"):
+                        new_list.extend([f"mlp.{m}", f"shared_experts.{m}"])
+                    elif m not in ("generate_linear", "orig_module", "prefill_linear"):
+                        new_list.append(m)
 
-            target_modules[:] = new_list
+                target_modules[:] = new_list
 
-        if finetuning_args.use_llama_pro:
-            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+            if finetuning_args.use_llama_pro:
+                target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+            rank_pattern = {}
+            alpha_pattern = {}
 
         if (
             finetuning_args.use_dora
@@ -283,6 +309,10 @@ def _setup_lora_tuning(
                 "use_dora": finetuning_args.use_dora,
                 "modules_to_save": modules_to_save,
             }
+            if rank_pattern:
+                peft_kwargs["rank_pattern"] = rank_pattern
+            if alpha_pattern:
+                peft_kwargs["alpha_pattern"] = alpha_pattern
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
                 "r": finetuning_args.oft_rank,
@@ -338,7 +368,7 @@ def _setup_lora_tuning(
             unfrozen_count = 0
             for name, param in model.named_parameters():
                 clean_name = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
-                if _matches_trainable_paths(clean_name, trainable_paths) and not param.requires_grad:
+                if _matches_prefix(clean_name, trainable_paths) and not param.requires_grad:
                     param.requires_grad_(True)
                     unfrozen_count += 1
             if unfrozen_count > 0:

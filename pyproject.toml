@@ -134,6 +134,7 @@ known-third-party = [
     "gradio",
     "numpy",
     "peft",
+    "speechlmm",
     "torch",
     "transformers",
     "trl",
