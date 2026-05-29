@@ -256,7 +256,11 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             elif "video_second_per_grid" in mm_inputs:  # for qwen2.5 omni
                 rope_index_kwargs["second_per_grids"] = mm_inputs.get("video_second_per_grid")
 
-            if getattr(self.model.config, "model_type", None) in ["qwen2_5_omni_thinker", "qwen3_omni_moe_thinker", "speechlmm"]:
+            if getattr(self.model.config, "model_type", None) in [
+                "qwen2_5_omni_thinker",
+                "qwen3_omni_moe_thinker",
+                "speechlmm",
+            ]:
                 rope_index_kwargs["use_audio_in_video"] = getattr(self.processor, "use_audio_in_video", False)
                 audio_seqlens = _audio_seqlens_from_input_ids(
                     features["input_ids"],

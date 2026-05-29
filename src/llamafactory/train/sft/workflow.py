@@ -144,9 +144,10 @@ def run_sft(
         if trainer.is_world_process_zero() and finetuning_args.plot_loss:
             keys = ["loss"]
             if isinstance(dataset_module.get("eval_dataset"), dict):
-                per_ds = [[f"eval_{key}_loss", f"eval_{key}_accuracy",
-                           f"eval_{key}_wer", f"eval_{key}_cer"]
-                          for key in dataset_module["eval_dataset"].keys()]
+                per_ds = [
+                    [f"eval_{key}_loss", f"eval_{key}_accuracy", f"eval_{key}_wer", f"eval_{key}_cer"]
+                    for key in dataset_module["eval_dataset"].keys()
+                ]
                 keys += sum(per_ds, [])
             else:
                 keys += ["eval_loss", "eval_accuracy", "eval_wer", "eval_cer"]

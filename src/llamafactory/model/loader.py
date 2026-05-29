@@ -173,7 +173,8 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
 
         elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
-            "qwen2_5_omni", "qwen3_omni_moe",
+            "qwen2_5_omni",
+            "qwen3_omni_moe",
         ):
             from speechlmm.models import SpeechLMMForConditionalGeneration
             from speechlmm.models.configuration_speechlmm import SpeechLMMConfig

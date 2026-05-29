@@ -173,8 +173,10 @@ TRAINABLE_MODULES_FILENAME = "trainable_modules.safetensors"
 
 
 class SaveTrainableModulesCallback(TrainerCallback):
-    """Saves trainable_module_paths weights to a separate safetensors file
-    in each checkpoint, so export_checkpoint.py can reconstruct the full model."""
+    """Saves trainable_module_paths weights to a separate safetensors file.
+
+    Written in each checkpoint so export_checkpoint.py can reconstruct the full model.
+    """
 
     def __init__(self, trainable_module_paths: list[str]) -> None:
         self.trainable_module_paths = trainable_module_paths

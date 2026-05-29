@@ -2041,8 +2041,9 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
 @dataclass
 class SpeechLMMPlugin(Qwen2OmniPlugin):
-    """Plugin for SpeechLMM: handles input audio (mel features) and output
-    audio (codec tokens) for joint Thinker + Talker training.
+    """Plugin for SpeechLMM: handles input audio (mel features) and output audio.
+
+    Handles codec tokens for joint Thinker + Talker training.
 
     Differences from Qwen2OmniPlugin:
     - Assistant-turn ``<audio>`` placeholders are stripped (the original
@@ -2060,8 +2061,9 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
-        """Process messages, distinguishing input audio (user turns) from
-        output audio (assistant turns).
+        """Process messages for input vs output audio.
+
+        Distinguishes user-turn input audio from assistant-turn output audio.
 
         - User-turn ``<audio>`` → expanded into mel-feature placeholder tokens
           (delegated to the parent Qwen2OmniPlugin).

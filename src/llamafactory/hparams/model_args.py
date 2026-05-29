@@ -21,9 +21,8 @@ from typing import Any, Literal, Self
 
 import torch
 from omegaconf import OmegaConf
-from transformers.training_args import _convert_str_dict
-
 from speechlmm.training.hparams import SpeechLMMModelArguments
+from transformers.training_args import _convert_str_dict
 
 from ..extras.constants import AttentionFunction, EngineName, QuantizationMethod, RopeScaling
 from ..extras.logging import get_logger
@@ -153,7 +152,9 @@ class BaseModelArguments:
     )
     gradient_checkpointing_all_layers: bool = field(
         default=False,
-        metadata={"help": "Apply gradient checkpointing to all layers instead of only trainable ones (saves VRAM at the cost of extra recomputation)."},
+        metadata={
+            "help": "Apply gradient checkpointing to all layers instead of only trainable ones (saves VRAM at the cost of extra recomputation)."
+        },
     )
     upcast_layernorm: bool = field(
         default=False,

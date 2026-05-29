@@ -268,49 +268,59 @@ def build_component_lora_targets(
     components: list[ComponentSpec] = []
 
     if finetuning_args.lora_audio_encoder:
-        components.append((
-            "audio_encoder",
-            finetuning_args.lora_audio_encoder_rank,
-            finetuning_args.lora_audio_encoder_alpha,
-            composite.audio_model_keys,
-            composite.audio_adapter_prefixes,
-        ))
+        components.append(
+            (
+                "audio_encoder",
+                finetuning_args.lora_audio_encoder_rank,
+                finetuning_args.lora_audio_encoder_alpha,
+                composite.audio_model_keys,
+                composite.audio_adapter_prefixes,
+            )
+        )
 
     if finetuning_args.lora_audio_adapters:
-        components.append((
-            "audio_adapters",
-            finetuning_args.lora_audio_adapters_rank,
-            finetuning_args.lora_audio_adapters_alpha,
-            composite.audio_adapter_prefixes,
-            [],
-        ))
+        components.append(
+            (
+                "audio_adapters",
+                finetuning_args.lora_audio_adapters_rank,
+                finetuning_args.lora_audio_adapters_alpha,
+                composite.audio_adapter_prefixes,
+                [],
+            )
+        )
 
     if finetuning_args.lora_language_model:
-        components.append((
-            "language_model",
-            finetuning_args.lora_language_model_rank,
-            finetuning_args.lora_language_model_alpha,
-            composite.language_model_keys,
-            [],
-        ))
+        components.append(
+            (
+                "language_model",
+                finetuning_args.lora_language_model_rank,
+                finetuning_args.lora_language_model_alpha,
+                composite.language_model_keys,
+                [],
+            )
+        )
 
     if finetuning_args.lora_lipread_encoder:
-        components.append((
-            "lipread_encoder",
-            finetuning_args.lora_lipread_encoder_rank,
-            finetuning_args.lora_lipread_encoder_alpha,
-            composite.lipread_model_keys,
-            [],
-        ))
+        components.append(
+            (
+                "lipread_encoder",
+                finetuning_args.lora_lipread_encoder_rank,
+                finetuning_args.lora_lipread_encoder_alpha,
+                composite.lipread_model_keys,
+                [],
+            )
+        )
 
     if finetuning_args.lora_lipread_adapter:
-        components.append((
-            "lipread_adapter",
-            finetuning_args.lora_lipread_adapter_rank,
-            finetuning_args.lora_lipread_adapter_alpha,
-            composite.lipread_adapter_keys,
-            [],
-        ))
+        components.append(
+            (
+                "lipread_adapter",
+                finetuning_args.lora_lipread_adapter_rank,
+                finetuning_args.lora_lipread_adapter_alpha,
+                composite.lipread_adapter_keys,
+                [],
+            )
+        )
 
     # TODO: add lora_talker block (composite.talker_keys, exclude code_predictor heads?)
     # TODO: add lora_vision_encoder block (composite.vision_model_keys)

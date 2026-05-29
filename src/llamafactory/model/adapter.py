@@ -25,7 +25,13 @@ from .model_utils.ktransformers import get_kt_peft_model, load_kt_peft_model
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
 from .model_utils.unsloth import get_unsloth_peft_model, load_unsloth_peft_model
-from .model_utils.visual import COMPOSITE_MODELS, _matches_prefix, build_component_lora_targets, get_forbidden_modules, patch_target_modules
+from .model_utils.visual import (
+    COMPOSITE_MODELS,
+    _matches_prefix,
+    build_component_lora_targets,
+    get_forbidden_modules,
+    patch_target_modules,
+)
 
 
 if TYPE_CHECKING:
@@ -222,8 +228,11 @@ def _setup_lora_tuning(
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
         # TODO: extend when adding lora_talker, lora_vision_encoder, lora_code2wav
         _component_flags = (
-            "lora_audio_encoder", "lora_audio_adapters", "lora_language_model",
-            "lora_lipread_encoder", "lora_lipread_adapter",
+            "lora_audio_encoder",
+            "lora_audio_adapters",
+            "lora_language_model",
+            "lora_lipread_encoder",
+            "lora_lipread_adapter",
         )
         has_component_lora = any(getattr(finetuning_args, f, False) for f in _component_flags)
 
