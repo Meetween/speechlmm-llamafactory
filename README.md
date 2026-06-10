@@ -1,3 +1,5 @@
+> **SpeechLMM users:** install from [speechlmm-v2](https://github.com/Meetween/speechlmm-v2), not this repo.
+
 ![# LLaMA Factory](assets/logo.png)
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/hiyouga/LLaMA-Factory?style=social)](https://github.com/hiyouga/LLaMA-Factory/stargazers)
