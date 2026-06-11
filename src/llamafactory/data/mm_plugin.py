@@ -37,6 +37,10 @@ from typing_extensions import override
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
 
+# Default cap when data_args.max_input_audio_seconds is unset: 18 min at 16 kHz
+# -> ~14,040 audio tokens, leaving headroom under cutoff_len=16384 for instruction +
+# labels. Whisper default cap was 300 s (5 min). Override via the YAML field.
+MAX_INPUT_AUDIO_SAMPLES = 18 * 60 * 16000  # 17,280,000
 
 if is_pillow_available():
     from PIL import Image
@@ -1901,16 +1905,23 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             )
 
         if len(audios) != 0:
+            sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audios = self._regularize_audios(
                 audios,
-                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                sampling_rate=sampling_rate,
             )["audios"]
+            max_audio_seconds = getattr(processor, "max_input_audio_seconds", None)
+            max_audio_samples = (
+                int(max_audio_seconds * sampling_rate) if max_audio_seconds else MAX_INPUT_AUDIO_SAMPLES
+            )
             mm_inputs.update(
                 feature_extractor(
                     audios,
-                    sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                    sampling_rate=sampling_rate,
                     return_attention_mask=True,
-                    padding="max_length",
+                    padding="longest",
+                    truncation=True,
+                    max_length=max_audio_samples,
                     return_tensors="pt",
                 )
             )
