@@ -51,7 +51,7 @@ class DataArguments:
         default=None,
         metadata={
             "help": "Max input audio length (seconds) before feature-extractor truncation. "
-            "Defaults to 18 minutes when unset. Keep consistent with cutoff_len (~13 audio tokens/sec)."
+            "When unset, the Whisper feature extractor uses its default (no YAML cap)."
         },
     )
     train_on_prompt: bool = field(
