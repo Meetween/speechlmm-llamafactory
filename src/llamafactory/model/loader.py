@@ -184,6 +184,10 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration._from_config(config)
             else:
                 model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
+                lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
+                if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
+                    model.load_auto_avsr_weights(lipread_weights)
+
 
         elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
             "qwen2_5_omni",
@@ -246,14 +250,9 @@ def load_model(
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
     # PEFT can reset lipread encoder weights (incl. BN running stats); reload after adapters.
-    # Skip for speechlmm checkpoints: weights are already in the export / from_pretrained,
-    # and reloading a full .pth fails under ZeRO-3 (partitioned lipread_encoder params).
+    # Safe under ZeRO-3: load_auto_avsr_weights wraps load_state_dict with GatheredParameters.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
-    if (
-        lipread_weights
-        and hasattr(model, "load_auto_avsr_weights")
-        and getattr(config, "model_type", None) != "speechlmm"
-    ):
+    if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
         model.load_auto_avsr_weights(lipread_weights)
 
     if add_valuehead:
