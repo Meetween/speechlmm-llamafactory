@@ -186,10 +186,10 @@ def _check_extra_dependencies(
         if training_args.deepspeed:
             check_version("deepspeed", mandatory=True)
 
-        if training_args.predict_with_generate:
-            check_version("jieba", mandatory=True)
-            check_version("nltk", mandatory=True)
-            check_version("rouge_chinese", mandatory=True)
+        # if training_args.predict_with_generate:
+        #     check_version("jieba", mandatory=True)
+        #     check_version("nltk", mandatory=True)
+        #     check_version("rouge_chinese", mandatory=True)
 
 
 def _parse_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:

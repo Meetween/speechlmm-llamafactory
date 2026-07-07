@@ -79,27 +79,31 @@ class ComputeAccuracy:
     r"""Compute accuracy and corpus-level WER/CER, supporting `batch_eval_metrics`."""
 
     tokenizer: Optional["PreTrainedTokenizer"] = field(default=None, repr=False)
+    predict_with_generate: bool = False
+
+    def _compute_text_metrics(self, result: dict[str, float]):
+        if self._ref_texts:
+            try:
+                from jiwer import cer, wer
+
+                result["wer"] = float(wer(self._ref_texts, self._pred_texts))
+                result["cer"] = float(cer(self._ref_texts, self._pred_texts))
+            except ImportError:
+                total_w_edits = total_w_ref = total_c_edits = total_c_ref = 0
+                for ref, hyp in zip(self._ref_texts, self._pred_texts):
+                    rw, hw = ref.split(), hyp.split()
+                    total_w_ref += len(rw)
+                    total_w_edits += _levenshtein(rw, hw)
+                    total_c_ref += len(ref)
+                    total_c_edits += _levenshtein(list(ref), list(hyp))
+                result["wer"] = total_w_edits / max(total_w_ref, 1)
+                result["cer"] = total_c_edits / max(total_c_ref, 1)
 
     def _dump(self) -> Optional[dict[str, float]]:
         result = None
         if hasattr(self, "score_dict"):
             result = {k: float(np.mean(v)) for k, v in self.score_dict.items() if v}
-            if self._ref_texts:
-                try:
-                    from jiwer import cer, wer
-
-                    result["wer"] = float(wer(self._ref_texts, self._pred_texts))
-                    result["cer"] = float(cer(self._ref_texts, self._pred_texts))
-                except ImportError:
-                    total_w_edits = total_w_ref = total_c_edits = total_c_ref = 0
-                    for ref, hyp in zip(self._ref_texts, self._pred_texts):
-                        rw, hw = ref.split(), hyp.split()
-                        total_w_ref += len(rw)
-                        total_w_edits += _levenshtein(rw, hw)
-                        total_c_ref += len(ref)
-                        total_c_edits += _levenshtein(list(ref), list(hyp))
-                    result["wer"] = total_w_edits / max(total_w_ref, 1)
-                    result["cer"] = total_c_edits / max(total_c_ref, 1)
+            self._compute_text_metrics(result)
 
         self.score_dict: dict[str, list[float]] = {"accuracy": []}
         self._ref_texts: list[str] = []
@@ -111,6 +115,12 @@ class ComputeAccuracy:
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
+        if self.predict_with_generate:
+            return self._compute_generated(preds, labels, compute_result)
+        else:
+            return self._compute_logits(preds, labels, compute_result)
+
+    def _compute_logits(self, preds, labels, compute_result):
         for i in range(len(preds)):
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
@@ -125,6 +135,38 @@ class ComputeAccuracy:
 
         if compute_result:
             return self._dump()
+
+    def _compute_generated(self, preds, labels, compute_result) -> Optional[dict[str, float]]:
+        if self.tokenizer is None:
+            return None
+
+        pad_token_id = self.tokenizer.pad_token_id
+        preds = np.where(preds != IGNORE_INDEX, preds, pad_token_id)
+        labels = np.where(labels != IGNORE_INDEX, labels, pad_token_id)
+
+        for i in range(len(preds)):
+            pred = preds[i]
+            pad_len = np.nonzero(pred != pad_token_id)[0]
+            if len(pad_len):
+                pred = np.concatenate((pred[pad_len[0]:], pred[:pad_len[0]]), axis=-1)
+
+            label = labels[i]
+            pad_len_l = np.nonzero(label != pad_token_id)[0]
+            if len(pad_len_l):
+                label = np.concatenate((label[pad_len_l[0]:], label[:pad_len_l[0]]), axis=-1)
+
+            pred_text = self.tokenizer.decode(pred, skip_special_tokens=True)
+            label_text = self.tokenizer.decode(label, skip_special_tokens=True)
+            if label_text.strip():
+                self._ref_texts.append(label_text)
+                self._pred_texts.append(pred_text)
+
+        if compute_result:
+            result = {}
+            self._compute_text_metrics(result)
+            self._ref_texts = []
+            self._pred_texts = []
+            return result if result else None
 
 
 @dataclass

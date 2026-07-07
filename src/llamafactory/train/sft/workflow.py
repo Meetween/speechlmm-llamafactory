@@ -90,7 +90,7 @@ def run_sft(
             raise NotImplementedError("`compute_accuracy` is not supported in KTransformers SFT yet.")
 
     if training_args.predict_with_generate:
-        metric_module["compute_metrics"] = ComputeSimilarity(tokenizer=tokenizer)
+        metric_module["compute_metrics"] = ComputeAccuracy(tokenizer=tokenizer, predict_with_generate=True)
     elif finetuning_args.compute_accuracy:
         metric_module["compute_metrics"] = ComputeAccuracy(tokenizer=tokenizer)
         metric_module["preprocess_logits_for_metrics"] = eval_logit_processor
