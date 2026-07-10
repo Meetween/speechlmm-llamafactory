@@ -184,10 +184,6 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration._from_config(config)
             else:
                 model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
-                lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
-                if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
-                    model.load_auto_avsr_weights(lipread_weights)
-
 
         elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
             "qwen2_5_omni",
@@ -249,11 +245,16 @@ def load_model(
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
-    # PEFT can reset lipread encoder weights (incl. BN running stats); reload after adapters.
-    # Safe under ZeRO-3: load_auto_avsr_weights wraps load_state_dict with GatheredParameters.
+    # The frozen AutoAVSR lipread encoder loses its BatchNorm running stats on load: under
+    # ZeRO-3 the 0-sized init makes transformers' storage-based tied-weight detection group
+    # every lipread param/buffer, so the BN buffers get dropped by from_pretrained (speechlmm
+    # resume) or reset by PEFT (wrapper path). Reloading the pristine .pth restores them
+    # exactly (the encoder is never trained); load_auto_avsr_weights is ZeRO-3-safe
+    # (GatheredParameters). Requires lipread_encoder_weights to be set on the resume config.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
     if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
         model.load_auto_avsr_weights(lipread_weights)
+        logger.info_rank0(f"Restored frozen AutoAVSR lipread encoder from {lipread_weights}")
 
     if add_valuehead:
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
