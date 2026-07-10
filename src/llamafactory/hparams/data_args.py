@@ -47,6 +47,13 @@ class DataArguments:
         default=2048,
         metadata={"help": "The cutoff length of the tokenized inputs in the dataset."},
     )
+    max_input_audio_seconds: float | None = field(
+        default=None,
+        metadata={
+            "help": "Max input audio length (seconds) before feature-extractor truncation. "
+            "When unset, the Whisper feature extractor uses its default (no YAML cap)."
+        },
+    )
     train_on_prompt: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the mask on the prompt."},
