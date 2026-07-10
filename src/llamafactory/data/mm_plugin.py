@@ -51,7 +51,6 @@ from ..extras.constants import (
 )
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
 
-
 if is_pillow_available():
     from PIL import Image
     from PIL.Image import Image as ImageObject
@@ -1927,19 +1926,26 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             )
 
         if len(audios) != 0:
+            sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audios = self._regularize_audios(
                 audios,
-                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                sampling_rate=sampling_rate,
             )["audios"]
-            mm_inputs.update(
-                feature_extractor(
-                    audios,
-                    sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
-                    return_attention_mask=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
+            max_audio_seconds = getattr(processor, "max_input_audio_seconds", None)
+            fe_kwargs = dict(
+                sampling_rate=sampling_rate,
+                return_attention_mask=True,
+                return_tensors="pt",
             )
+            if max_audio_seconds is not None:
+                fe_kwargs.update(
+                    padding="longest",
+                    truncation=True,
+                    max_length=int(max_audio_seconds * sampling_rate),
+                )
+            else:
+                fe_kwargs["padding"] = "max_length"
+            mm_inputs.update(feature_extractor(audios, **fe_kwargs))
             mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask")  # prevent conflicts
         return mm_inputs
 
@@ -2088,7 +2094,9 @@ class LipreadProcessor:
 
 @dataclass
 class SpeechLMMPlugin(Qwen2OmniPlugin):
-    """Plugin for SpeechLMM: handles input audio (mel features) and output audio (codec tokens).
+    """Plugin for SpeechLMM: handles input audio (mel features) and output audio.
+
+    Handles codec tokens for joint Thinker + Talker training.
 
     Differences from Qwen2OmniPlugin:
     - Assistant-turn ``<audio>`` placeholders are stripped (the original
@@ -2128,7 +2136,9 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         processor: Optional["MMProcessor"],
         lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
-        """Process messages, distinguishing input audio (user turns) from output audio (assistant turns).
+        """Process messages for input vs output audio.
+
+        Distinguishes user-turn input audio from assistant-turn output audio.
 
         - User-turn ``<audio>`` -> expanded into mel-feature placeholder tokens
           (delegated to the parent Qwen2OmniPlugin).
