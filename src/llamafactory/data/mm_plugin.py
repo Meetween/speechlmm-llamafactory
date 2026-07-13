@@ -67,12 +67,6 @@ else:
     from transformers.image_utils import make_batched_videos, make_flat_list_of_images
 
 
-from torchcodec.decoders import VideoDecoder
-from torchcodec.samplers import clips_at_regular_timestamps
-from torchcodec.transforms import Resize
-from torchvision.transforms import v2
-
-
 if TYPE_CHECKING:
     from av.stream import Stream
     from numpy.typing import NDArray
@@ -2072,23 +2066,38 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
 @dataclass
 class LipreadProcessor:
+    """Decode a lip-crop video into normalized grayscale frames for AutoAVSR.
+
+    ``torchcodec`` and ``torchvision`` are imported lazily so that importing this
+    module does not hard-require them on non-lipread runs.
+    """
+
     H: int = LIPREAD_FRAME_SIZE
     W: int = LIPREAD_FRAME_SIZE
-    transforms: v2.Compose = field(
-        default_factory=lambda: v2.Compose(
-            [
-                v2.Grayscale(),
-                v2.ToTensor(),
-                v2.ToDtype(torch.float, scale=True),
-                v2.Normalize(mean=[0.421], std=[0.165]),
-            ]
-        )
-    )
+    _transforms: Optional["v2.Compose"] = field(default=None, init=False, repr=False)
+
+    def _get_transforms(self) -> "v2.Compose":
+        if self._transforms is None:
+            from torchvision.transforms import v2
+
+            self._transforms = v2.Compose(
+                [
+                    v2.Grayscale(),
+                    v2.ToTensor(),
+                    v2.ToDtype(torch.float, scale=True),
+                    v2.Normalize(mean=[0.421], std=[0.165]),
+                ]
+            )
+        return self._transforms
 
     def __call__(self, video_path):
+        from torchcodec.decoders import VideoDecoder
+        from torchcodec.samplers import clips_at_regular_timestamps
+        from torchcodec.transforms import Resize
+
         video_dec = VideoDecoder(video_path, transforms=[Resize((self.H, self.W))])
         video = clips_at_regular_timestamps(video_dec, seconds_between_clip_starts=1 / LIPREAD_FPS)
-        video = self.transforms(video.data)  # [t, b, 1, H, W]
+        video = self._get_transforms()(video.data)  # [t, b, 1, H, W]
         return video[:, 0, :, :]
 
 
