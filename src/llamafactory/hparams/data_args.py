@@ -18,9 +18,11 @@
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from speechlmm.training.hparams import SpeechLMMDynamicBatchingArguments
+
 
 @dataclass
-class DataArguments:
+class DataArguments(SpeechLMMDynamicBatchingArguments):
     r"""Arguments pertaining to what data we are going to input our model for training and evaluation."""
 
     template: str | None = field(
@@ -199,6 +201,12 @@ class DataArguments:
 
         if self.packing:
             self.cutoff_len -= 1  # avoid pad_to_multiple_of, needs improve
+
+        self._validate_dynamic_batching()
+        if self.dynamic_batching and self.streaming:
+            raise ValueError("dynamic batching does not support streaming datasets")
+        if self.dynamic_batching and self.packing:
+            raise ValueError("dynamic batching v1 does not support sequence packing")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

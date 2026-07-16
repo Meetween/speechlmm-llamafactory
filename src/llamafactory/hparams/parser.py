@@ -238,10 +238,11 @@ def get_ray_args(args: dict[str, Any] | list[str] | None = None) -> RayArguments
 
 
 def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
+    raw_args = read_args(args)
     if is_env_enabled("USE_MCA"):
-        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(args)
+        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(raw_args)
     else:
-        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_args(args)
+        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_args(raw_args)
         finetuning_args.use_mca = False
 
     # Setup logging
@@ -249,6 +250,20 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         _set_transformers_logging()
 
     # Check arguments
+    if data_args.dynamic_batching:
+        explicitly_uses_epochs = (
+            isinstance(raw_args, dict) and "num_train_epochs" in raw_args
+        ) or (
+            isinstance(raw_args, list)
+            and any(str(value).split("=", 1)[0] == "--num_train_epochs" for value in raw_args)
+        )
+        if explicitly_uses_epochs:
+            raise ValueError("dynamic batching is step-based; remove num_train_epochs and set max_steps")
+        if finetuning_args.stage != "sft":
+            raise ValueError("dynamic batching v1 supports only standard SFT")
+        if training_args.max_steps <= 0:
+            raise ValueError("dynamic batching requires max_steps > 0")
+
     if finetuning_args.stage != "sft":
         if training_args.predict_with_generate:
             raise ValueError("`predict_with_generate` cannot be set as True except SFT.")
