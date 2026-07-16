@@ -295,6 +295,9 @@ def get_dataset(
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
+    if processor is not None and data_args.max_input_audio_seconds is not None:
+        setattr(processor, "max_input_audio_seconds", data_args.max_input_audio_seconds)
+
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:
         if has_tokenized_data(data_args.tokenized_path):
