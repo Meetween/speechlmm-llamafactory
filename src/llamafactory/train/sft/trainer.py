@@ -17,12 +17,22 @@
 
 import json
 import os
+import re
+from collections import Counter
+from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+from speechlmm.data_loading_optimization import (
+    DynamicBatchPlan,
+    GlobalDynamicBatchSampler,
+    count_valid_shifted_target_tokens,
+)
+from speechlmm.memory_estimation.probing import get_memory_probe, record_memory
 from transformers import Seq2SeqTrainer
+from transformers.trainer_utils import seed_worker
 from typing_extensions import override
 
 from ...extras import logging
@@ -43,6 +53,10 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _probe_tensors(inputs: dict[str, Any], keys: tuple[str, ...]) -> dict[str, torch.Tensor]:
+    return {key: inputs[key] for key in keys if key in inputs and torch.is_tensor(inputs[key])}
+
+
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
 
@@ -52,21 +66,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         processor: Optional["ProcessorMixin"],
         model_args: Optional["ModelArguments"] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
+        dynamic_batch_plan: Optional[DynamicBatchPlan] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
         # Configure FP8 environment if enabled
         training_args: TrainingArguments = kwargs.get("args")
+        self.dynamic_batch_plan = dynamic_batch_plan
+        if dynamic_batch_plan is not None:
+            training_args.accelerator_config.split_batches = False
+            training_args.accelerator_config.dispatch_batches = False
+            training_args.accelerator_config.even_batches = False
+            training_args.average_tokens_across_devices = True
         if training_args.fp8:
             configure_fp8_environment(training_args)
             if getattr(training_args, "fp8_backend", "auto") == "te":
                 patch_accelerator_for_fp8()
 
         super().__init__(**kwargs)
-        if processor is not None:
+        self._last_dynamic_metrics_step = 0
+        if processor is not None and dynamic_batch_plan is None:
             # avoid wrong loss under gradient accumulation
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
             self.model_accepts_loss_kwargs = False
+        elif dynamic_batch_plan is not None:
+            self.model_accepts_loss_kwargs = True
 
         # find_labels() auto-detects all *label* params (e.g. codec_labels),
         # but only "labels" is guaranteed present in every batch.
@@ -122,8 +146,242 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
+    def get_train_dataloader(self) -> "torch.utils.data.DataLoader":
+        if self.dynamic_batch_plan is None:
+            return super().get_train_dataloader()
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        dataset = self.train_dataset
+        data_collator = self.data_collator
+        try:
+            import datasets
+
+            if isinstance(dataset, datasets.Dataset):
+                dataset = self._remove_unused_columns(dataset, description="Training")
+            else:
+                data_collator = self._get_collator_with_removed_columns(
+                    data_collator, description="Training"
+                )
+        except ImportError:
+            data_collator = self._get_collator_with_removed_columns(
+                data_collator, description="Training"
+            )
+
+        should_fork = torch.backends.mps.is_available() and self.args.dataloader_num_workers > 1
+        dataloader_params = {
+            "batch_sampler": GlobalDynamicBatchSampler(self.dynamic_batch_plan),
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "multiprocessing_context": "fork" if should_fork else None,
+            "prefetch_factor": self.args.dataloader_prefetch_factor,
+            "worker_init_fn": partial(
+                seed_worker,
+                num_workers=self.args.dataloader_num_workers,
+                rank=self.args.process_index,
+            ),
+        }
+        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_params)
+        return self.accelerator.prepare(dataloader)
+
+    @override
+    def _get_num_items_in_batch(self, batch_samples, device):
+        if self.dynamic_batch_plan is None:
+            return super()._get_num_items_in_batch(batch_samples, device)
+        if not batch_samples or "labels" not in batch_samples[0]:
+            raise ValueError("dynamic batching requires labels in every training microbatch")
+        num_items = count_valid_shifted_target_tokens(batch_samples, ignore_index=IGNORE_INDEX)
+        if self.args.world_size > 1:
+            num_items = self.accelerator.gather(num_items.to(device)).sum()
+        return num_items.to(device)
+
+    def _dynamic_step_metrics(self, global_step: int) -> dict[str, float]:
+        if self.dynamic_batch_plan is None or global_step <= 0:
+            return {}
+        accumulation = self.dynamic_batch_plan.settings.gradient_accumulation_steps
+        start = (global_step - 1) * accumulation
+        steps = self.dynamic_batch_plan.microsteps[start : start + accumulation]
+        if not steps:
+            return {}
+        batches = [batch for step in steps for batch in step.local_batches]
+        local = [step.local_batches[self.args.process_index] for step in steps]
+        padded = sum(
+            batch.estimate.batch_size * batch.estimate.padded_thinker_tokens for batch in batches
+        )
+        useful = sum(batch.unpadded_thinker_tokens for batch in batches)
+        straggler_ratio = max(
+            max(batch.estimate.thinker_activation_bytes for batch in step.local_batches)
+            / min(batch.estimate.thinker_activation_bytes for batch in step.local_batches)
+            for step in steps
+        )
+        utilization = max(
+            batch.estimate.allocated_peak_bytes / batch.budget_bytes for batch in batches
+        )
+        allocator_slack = 0
+        if torch.cuda.is_available():
+            allocator_slack = max(
+                0, torch.cuda.max_memory_reserved() - torch.cuda.max_memory_allocated()
+            )
+        metrics = {
+            "dynamic_local_samples": float(sum(len(batch.dataset_indices) for batch in local)),
+            "dynamic_global_samples": float(sum(len(batch.dataset_indices) for batch in batches)),
+            "dynamic_local_valid_target_tokens": float(
+                sum(batch.estimate.valid_target_tokens for batch in local)
+            ),
+            "dynamic_valid_target_tokens": float(
+                sum(batch.estimate.valid_target_tokens for batch in batches)
+            ),
+            "dynamic_thinker_tokens": float(useful),
+            "dynamic_batch_size_min": float(min(len(batch.dataset_indices) for batch in batches)),
+            "dynamic_batch_size_max": float(max(len(batch.dataset_indices) for batch in batches)),
+            "dynamic_audio_feature_frames": float(sum(batch.audio_feature_frames for batch in batches)),
+            "dynamic_audio_chunks": float(sum(step.global_audio_chunks for step in steps)),
+            "dynamic_visual_grids": float(
+                sum(batch.estimate.visual_grid_count for batch in batches)
+            ),
+            "dynamic_visual_patch_tokens": float(sum(batch.visual_patch_tokens for batch in batches)),
+            "dynamic_predicted_peak_bytes": float(
+                max(batch.estimate.allocated_peak_bytes for batch in batches)
+            ),
+            "dynamic_target_utilization": utilization,
+            "dynamic_target_unused_fraction": 1.0
+            - self.dynamic_batch_plan.settings.target_memory_used,
+            "dynamic_allocator_reserved_unused_bytes": float(allocator_slack),
+            "dynamic_padding_efficiency": useful / padded,
+            "dynamic_predicted_rank_straggler_ratio": straggler_ratio,
+        }
+        source_counts = Counter(batch.source_id for batch in batches)
+        requested = self.dynamic_batch_plan.settings.source_probabilities or {}
+        for source in sorted(set(source_counts) | set(requested)):
+            safe_source = re.sub(r"[^A-Za-z0-9_]+", "_", source).strip("_") or "source"
+            metrics[f"dynamic_source_{safe_source}_realized_fraction"] = (
+                source_counts[source] / len(batches)
+            )
+            if source in requested:
+                metrics[f"dynamic_source_{safe_source}_requested_probability"] = float(
+                    requested[source]
+                )
+        bottlenecks = Counter(
+            batch.estimate.bottleneck_phase.split(":", 1)[0] for batch in batches
+        )
+        for phase, count in bottlenecks.items():
+            metrics[f"dynamic_bottleneck_{phase}_fraction"] = count / len(batches)
+        return metrics
+
+    @override
+    def _maybe_log_save_evaluate(
+        self,
+        tr_loss,
+        grad_norm,
+        model,
+        trial,
+        epoch,
+        ignore_keys_for_eval,
+        start_time,
+        learning_rate=None,
+    ) -> None:
+        current_step = int(self.state.global_step)
+        if (
+            self.dynamic_batch_plan is not None
+            and current_step > self._last_dynamic_metrics_step
+        ):
+            self.log(self._dynamic_step_metrics(current_step), start_time)
+            self._last_dynamic_metrics_step = current_step
+        return super()._maybe_log_save_evaluate(
+            tr_loss,
+            grad_norm,
+            model,
+            trial,
+            epoch,
+            ignore_keys_for_eval,
+            start_time,
+            learning_rate,
+        )
+
+    @override
     def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+        recorder = get_memory_probe()
+        if recorder is not None:
+            recorder.set_step(getattr(self.state, "global_step", None))
+            recorder.dump_zero3_execution_trace(model)
+
+        record_memory(
+            "trainer.compute_loss.before",
+            tensors=_probe_tensors(
+                inputs,
+                (
+                    "input_ids",
+                    "attention_mask",
+                    "labels",
+                    "input_features",
+                    "feature_attention_mask",
+                    "position_ids",
+                    "codec_labels",
+                ),
+            ),
+        )
+        try:
+            loss = super().compute_loss(model, inputs, *args, **kwargs)
+        except Exception as exc:
+            if recorder is not None:
+                recorder.record_exception("trainer.compute_loss.exception", exc)
+            raise
+
+        tensors = {"loss": loss[0] if isinstance(loss, tuple) and torch.is_tensor(loss[0]) else loss}
+        record_memory("trainer.compute_loss.after", tensors={k: v for k, v in tensors.items() if torch.is_tensor(v)})
+        return loss
+
+    @override
+    def _prepare_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        record_memory(
+            "trainer.prepare_inputs.before",
+            tensors=_probe_tensors(inputs, ("input_ids", "attention_mask", "labels")),
+        )
+        try:
+            prepared = super()._prepare_inputs(inputs)
+        except Exception as exc:
+            recorder = get_memory_probe()
+            if recorder is not None:
+                recorder.record_exception("trainer.prepare_inputs.exception", exc)
+            raise
+
+        record_memory(
+            "trainer.prepare_inputs.after",
+            tensors=_probe_tensors(
+                prepared,
+                (
+                    "input_ids",
+                    "attention_mask",
+                    "labels",
+                    "input_features",
+                    "feature_attention_mask",
+                    "position_ids",
+                    "codec_labels",
+                ),
+            ),
+        )
+        return prepared
+
+    @override
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        recorder = get_memory_probe()
+        if recorder is not None:
+            recorder.set_step(getattr(self.state, "global_step", None))
+
+        record_memory("trainer.training_step.before")
+        try:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+        except Exception as exc:
+            if recorder is not None:
+                recorder.record_exception("trainer.training_step.exception", exc)
+            raise
+
+        record_memory("trainer.training_step.after_backward", tensors={"detached_loss": loss})
+        if recorder is not None:
+            recorder.dump_snapshot("after_backward")
+        return loss
 
     @override
     def prediction_step(

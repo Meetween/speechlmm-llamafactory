@@ -17,6 +17,13 @@
 
 from typing import TYPE_CHECKING, Optional
 
+from speechlmm.data_loading_optimization.integration import (
+    DynamicBatchingCheckpointCallback,
+    build_dynamic_batch_plan,
+    dynamic_plan_metrics,
+)
+from speechlmm.memory_estimation.probing import configure_memory_probe, get_memory_probe, record_memory
+
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
@@ -46,11 +53,65 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    if getattr(model_args, "memory_probe", False):
+        probe_dir = model_args.memory_probe_output_dir or f"{training_args.output_dir}/memory_probe"
+        configure_memory_probe(
+            enabled=True,
+            output_dir=probe_dir,
+            sync_cuda=model_args.memory_probe_sync_cuda,
+            record_shapes=model_args.memory_probe_record_shapes,
+            nvml=model_args.memory_probe_nvml,
+            rank_zero_only=model_args.memory_probe_rank_zero_only,
+            loss_breakdown=model_args.memory_probe_loss_breakdown,
+            allocator_stats=model_args.memory_probe_allocator_stats,
+            driver_memory=model_args.memory_probe_driver_memory,
+            snapshot_rank=model_args.memory_probe_snapshot_rank,
+            memory_history=model_args.memory_probe_memory_history,
+            memory_history_max_entries=model_args.memory_probe_history_max_entries,
+        )
+        record_memory(
+            "sft.run_start",
+            extra={
+                "output_dir": training_args.output_dir,
+                "probe_dir": probe_dir,
+                "per_device_train_batch_size": training_args.per_device_train_batch_size,
+                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                "deepspeed": training_args.deepspeed,
+            },
+        )
+
     tokenizer_module = load_tokenizer(model_args)
+    record_memory("sft.after_load_tokenizer")
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
+    record_memory("sft.after_get_template")
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
+    record_memory("sft.after_get_dataset")
+    dynamic_batch_plan = None
+    if data_args.dynamic_batching:
+        dynamic_batch_plan = build_dynamic_batch_plan(
+            train_dataset=dataset_module["train_dataset"],
+            model_args=model_args,
+            data_args=data_args,
+            training_args=training_args,
+            finetuning_args=finetuning_args,
+            processor=tokenizer_module.get("processor"),
+        )
+        callbacks = list(callbacks or [])
+        callbacks.append(DynamicBatchingCheckpointCallback(dynamic_batch_plan))
+        record_memory(
+            "sft.after_dynamic_batch_plan",
+            extra={
+                "plan_hash": dynamic_batch_plan.plan_hash,
+                "distributed_microsteps": len(dynamic_batch_plan.microsteps),
+            },
+        )
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+    record_memory("sft.after_load_model")
+    recorder = get_memory_probe()
+    if recorder is not None:
+        recorder.start_memory_history()
+        recorder.dump_snapshot("after_load_model")
 
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
@@ -65,6 +126,7 @@ def run_sft(
         compute_dtype=model_args.compute_dtype,
         **tokenizer_module,
     )
+    record_memory("sft.after_data_collator")
 
     # Metric utils
     metric_module = {}
@@ -124,19 +186,32 @@ def run_sft(
             data_collator=data_collator,
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
+            dynamic_batch_plan=dynamic_batch_plan,
             **dataset_module,
             **tokenizer_module,
             **metric_module,
         )
+    record_memory("sft.after_trainer_init")
 
     # Training
     if training_args.do_train:
+        record_memory("sft.before_trainer_train")
+        recorder = get_memory_probe()
+        if recorder is not None:
+            recorder.dump_snapshot("before_trainer_train")
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-        trainer.save_model()
+        record_memory("sft.after_trainer_train")
+        if not getattr(model_args, "memory_probe_skip_model_save", False):
+            trainer.save_model()
+            record_memory("sft.after_save_model")
+        else:
+            record_memory("sft.model_save_skipped")
         if finetuning_args.include_effective_tokens_per_second:
             train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
                 dataset_module["train_dataset"], train_result.metrics, stage="sft"
             )
+        if dynamic_batch_plan is not None:
+            train_result.metrics.update(dynamic_plan_metrics(dynamic_batch_plan))
 
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
@@ -173,3 +248,7 @@ def run_sft(
 
     # Create model card
     create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)
+    record_memory("sft.run_end")
+    recorder = get_memory_probe()
+    if recorder is not None:
+        recorder.close()
