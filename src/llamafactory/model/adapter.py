@@ -43,6 +43,11 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _exact_target_module_pattern(target_modules: list[str]) -> str:
+    """Use PEFT regex mode so full composite-model paths cannot suffix-match siblings."""
+    return "|".join(re.escape(name) for name in target_modules)
+
+
 def _setup_full_tuning(
     model: "PreTrainedModel",
     finetuning_args: "FinetuningArguments",
@@ -249,7 +254,7 @@ def _setup_lora_tuning(
             # "talker.model.layers.0.q_proj"). Passing as a regex string triggers
             # re.fullmatch instead, giving exact matching. Remove this workaround if
             # PEFT adds native exact-match support for target_modules lists.
-            target_modules = "|".join(re.escape(n) for n in target_module_list)
+            target_modules = _exact_target_module_pattern(target_module_list)
         else:
             if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
                 target_modules = find_all_linear_modules(
@@ -272,6 +277,8 @@ def _setup_lora_tuning(
                 target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
             target_modules = patch_target_modules(model, finetuning_args, target_modules)
+            if getattr(model.config, "model_type", None) in COMPOSITE_MODELS:
+                target_modules = _exact_target_module_pattern(target_modules)
             rank_pattern = {}
             alpha_pattern = {}
 
