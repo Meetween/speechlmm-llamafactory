@@ -179,7 +179,16 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        dataset = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        if data_args.dynamic_batching:
+            reserved = {"_dynamic_source_id", "_dynamic_sample_id"} & set(dataset.column_names)
+            if reserved:
+                raise ValueError(f"dataset {dataset_name!r} uses reserved dynamic batching columns: {reserved}")
+            dataset = dataset.add_column("_dynamic_source_id", [dataset_name] * len(dataset))
+            dataset = dataset.add_column(
+                "_dynamic_sample_id", [f"{dataset_name}:{index}" for index in range(len(dataset))]
+            )
+        datasets[dataset_name] = dataset
 
     if return_dict:
         return datasets
@@ -348,6 +357,49 @@ def get_dataset(
             )
 
         # Combine train and eval dictionaries
+        if data_args.dynamic_batching:
+            from speechlmm.data_loading_optimization import (
+                build_batching_index_from_dataset,
+                load_batching_memory_profile,
+                write_batching_index,
+            )
+
+            tagged_train = train_dict.get("train")
+            if tagged_train is None:
+                raise ValueError("dynamic batching requires a training split")
+            temporary_columns = [
+                name
+                for name in ("_dynamic_source_id", "_dynamic_sample_id")
+                if name in tagged_train.column_names
+            ]
+            if len(temporary_columns) != 2:
+                raise ValueError("dynamic batching source provenance was lost during tokenization")
+            clean_train = tagged_train.remove_columns(temporary_columns)
+            if training_args.should_save:
+                loaded_profile = load_batching_memory_profile(data_args.dynamic_batching_memory_profile)
+                batching_index, batching_summary = build_batching_index_from_dataset(
+                    dataset=tagged_train,
+                    profile=loaded_profile.profile,
+                    shape_profile_fingerprint=loaded_profile.shape_fingerprint,
+                    source_id_column="_dynamic_source_id",
+                    sample_id_column="_dynamic_sample_id",
+                    media_root=data_args.media_dir,
+                    image_min_pixels=getattr(processor, "image_min_pixels", 32 * 32),
+                    image_max_pixels=getattr(processor, "image_max_pixels", 768 * 768),
+                    dataset_path=data_args.tokenized_path,
+                )
+                write_batching_index(
+                    batching_index, batching_summary, data_args.dynamic_batching_index
+                )
+                logger.info_rank0(
+                    f"Dynamic batching index is saved at {data_args.dynamic_batching_index}."
+                )
+            train_dict["train"] = clean_train
+            for key, eval_split in eval_dict.items():
+                removable = [name for name in temporary_columns if name in eval_split.column_names]
+                if removable:
+                    eval_dict[key] = eval_split.remove_columns(removable)
+
         dataset_dict = DatasetDict({**train_dict, **eval_dict})
 
         if data_args.tokenized_path is not None:  # save tokenized dataset to disk

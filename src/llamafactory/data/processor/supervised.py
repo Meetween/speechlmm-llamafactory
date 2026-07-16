@@ -125,6 +125,10 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["lipread"].append(examples["_lipread"][i])
             codec_tokens = examples.get("_codec_tokens", [None] * len(examples["_prompt"]))
             model_inputs["codec_tokens"].append(codec_tokens[i])
+            if "_dynamic_source_id" in examples:
+                model_inputs["_dynamic_source_id"].append(examples["_dynamic_source_id"][i])
+            if "_dynamic_sample_id" in examples:
+                model_inputs["_dynamic_sample_id"].append(examples["_dynamic_sample_id"][i])
 
         return model_inputs
 
