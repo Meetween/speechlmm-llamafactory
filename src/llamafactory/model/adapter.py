@@ -16,7 +16,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from peft import LoraConfig, LoraModel, OFTConfig, PeftModel, TaskType, get_peft_model
+from peft import LoraConfig, OFTConfig, PeftModel, TaskType, get_peft_model
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from ..extras import logging
@@ -24,6 +24,11 @@ from ..extras.constants import EngineName
 from .model_utils.ktransformers import get_kt_peft_model, load_kt_peft_model
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
+from .model_utils.qwen3_omni_moe_lora import (
+    create_lora_config_with_expert_lora,
+    force_eager_experts_on_model,
+    load_peft_model_maybe_expert_lora,
+)
 from .model_utils.unsloth import get_unsloth_peft_model, load_unsloth_peft_model
 from .model_utils.visual import (
     COMPOSITE_MODELS,
@@ -41,6 +46,18 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _needs_expert_lora(finetuning_args: "FinetuningArguments") -> bool:
+    return bool(getattr(finetuning_args, "lora_language_model_experts", False))
+
+
+def _force_eager_thinker_experts(model: "PreTrainedModel", config: "PretrainedConfig") -> None:
+    """Force eager expert backends on configs and fused Thinker expert modules."""
+    from .patcher import ensure_eager_thinker_experts
+
+    ensure_eager_thinker_experts(config)
+    force_eager_experts_on_model(model)
 
 
 def _setup_full_tuning(
@@ -209,7 +226,7 @@ def _setup_lora_tuning(
                 )
 
         for adapter in adapter_to_merge:
-            model: LoraModel = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = load_peft_model_maybe_expert_lora(model, adapter, **init_kwargs)
             model = model.merge_and_unload()
 
         if len(adapter_to_merge) > 0:
@@ -221,7 +238,9 @@ def _setup_lora_tuning(
             elif model_args.use_unsloth:
                 model = load_unsloth_peft_model(config, model_args, finetuning_args, is_trainable=is_trainable)
             else:
-                model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+                model = load_peft_model_maybe_expert_lora(
+                    model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs
+                )
 
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
@@ -325,6 +344,8 @@ def _setup_lora_tuning(
         if model_args.use_kt:
             if finetuning_args.finetuning_type == "oft":
                 raise ValueError("KTransformers is currently not supported for OFT.")
+            if _needs_expert_lora(finetuning_args):
+                raise ValueError("lora_language_model_experts is not supported with KTransformers.")
             if finetuning_args.finetuning_type == "lora":
                 peft_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
@@ -339,6 +360,8 @@ def _setup_lora_tuning(
         elif model_args.use_unsloth:
             if finetuning_args.finetuning_type == "oft":
                 raise ValueError("Unsloth is currently not supported for OFT.")
+            if _needs_expert_lora(finetuning_args):
+                raise ValueError("lora_language_model_experts is currently not supported with Unsloth.")
 
             model = get_unsloth_peft_model(model, model_args, peft_kwargs)
         else:
@@ -351,11 +374,25 @@ def _setup_lora_tuning(
                     peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
 
             if finetuning_args.finetuning_type == "lora":
-                peft_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    inference_mode=False,
-                    **peft_kwargs,
-                )
+                if _needs_expert_lora(finetuning_args):
+                    if finetuning_args.pissa_init:
+                        raise ValueError("lora_language_model_experts does not support PiSSA initialization.")
+                    if finetuning_args.use_dora:
+                        raise ValueError("lora_language_model_experts does not support DoRA.")
+                    if is_deepspeed_zero3_enabled() and model_args.adapter_name_or_path is not None:
+                        if len(model_args.adapter_name_or_path) > 1:
+                            raise ValueError(
+                                "lora_language_model_experts supports only a single adapter under ZeRO-3."
+                            )
+                    _force_eager_thinker_experts(model, config)
+                    peft_config = create_lora_config_with_expert_lora(**peft_kwargs)
+                    logger.info_rank0("Registered custom LoRA layer for Qwen3-Omni Thinker fused MoE experts.")
+                else:
+                    peft_config = LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        inference_mode=False,
+                        **peft_kwargs,
+                    )
             elif finetuning_args.finetuning_type == "oft":
                 peft_config = OFTConfig(
                     task_type=TaskType.CAUSAL_LM,

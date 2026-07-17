@@ -355,6 +355,37 @@ def build_component_lora_targets(
         else:
             logger.info_rank0(f"lora_{comp_name}: {added} Linear modules selected (rank={rank}, alpha={alpha}).")
 
+    if getattr(finetuning_args, "lora_language_model_experts", False):
+        from .qwen3_omni_moe_lora import is_qwen3_omni_thinker_experts
+
+        expert_rank = finetuning_args.lora_language_model_experts_rank
+        expert_alpha = finetuning_args.lora_language_model_experts_alpha
+        expert_count = 0
+        for name, module in model.named_modules():
+            if not is_qwen3_omni_thinker_experts(module):
+                continue
+            if not _matches_prefix(name, composite.language_model_keys):
+                continue
+            # Exclude Talker paths structurally (never target talker experts).
+            if name.startswith("talker.") or ".talker." in name:
+                continue
+            target_modules.append(name)
+            if expert_rank != finetuning_args.lora_rank:
+                rank_pattern[name] = expert_rank
+            if expert_alpha != finetuning_args.lora_alpha:
+                alpha_pattern[name] = expert_alpha
+            expert_count += 1
+        if expert_count == 0:
+            raise ValueError(
+                "lora_language_model_experts is enabled but no Qwen3OmniMoeThinkerTextExperts "
+                "modules were found under language_model prefixes. "
+                "Fused Thinker experts (Transformers 5.x) are required."
+            )
+        logger.info_rank0(
+            f"lora_language_model_experts: {expert_count} fused expert modules selected "
+            f"(rank={expert_rank}, alpha={expert_alpha})."
+        )
+
     return target_modules, rank_pattern, alpha_pattern
 
 
