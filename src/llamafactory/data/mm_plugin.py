@@ -109,6 +109,7 @@ logger = logging.get_logger(__name__)
 @dataclass(frozen=True)
 class AudioTokenLayout:
     input_samples: int
+    processed_samples: int
     sampling_rate: int
     hop_length: int
     feature_frames: int
@@ -126,6 +127,8 @@ class VisualTokenLayout:
     thinker_tokens: int
     sampled_frames: int
     seconds_per_grid: float
+    source_duration_seconds: float | None = None
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -1583,6 +1586,8 @@ class Qwen2VLPlugin(BasePlugin):
         grid_t: int,
         sampled_frames: int,
         seconds_per_grid: float,
+        source_duration_seconds: float | None = None,
+        truncated: bool = False,
     ) -> VisualTokenLayout:
         patch_size = int(getattr(component, "patch_size"))
         merge_size = int(getattr(component, "merge_size"))
@@ -1606,6 +1611,8 @@ class Qwen2VLPlugin(BasePlugin):
             thinker_tokens=thinker_tokens,
             sampled_frames=sampled_frames,
             seconds_per_grid=seconds_per_grid,
+            source_duration_seconds=source_duration_seconds,
+            truncated=truncated,
         )
 
     def _get_image_layout(self, image: "ImageInput", processor: "MMProcessor") -> VisualTokenLayout:
@@ -1665,6 +1672,8 @@ class Qwen2VLPlugin(BasePlugin):
                     raise ValueError("Variable-resolution frame lists require full processing.")
                 width, height = dimensions[0]
                 effective_fps = video_fps
+                source_duration = sample_count / video_fps
+                truncated = False
             else:
                 position = video.tell() if hasattr(video, "tell") else None
                 try:
@@ -1678,9 +1687,14 @@ class Qwen2VLPlugin(BasePlugin):
                         sample_count = len(
                             self._get_video_sample_indices(stream, video_fps=video_fps, video_maxlen=video_maxlen)
                         )
+                        desired_samples = min(
+                            int(stream.frames), max(1, math.floor(duration * video_fps))
+                        )
                         width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0))
                         height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0))
                         effective_fps = sample_count / duration
+                        source_duration = duration
+                        truncated = desired_samples > video_maxlen
                 finally:
                     if position is not None and hasattr(video, "seek"):
                         video.seek(position)
@@ -1702,6 +1716,8 @@ class Qwen2VLPlugin(BasePlugin):
                 grid_t=frame_count // temporal_patch_size,
                 sampled_frames=sample_count,
                 seconds_per_grid=float(getattr(image_processor, "temporal_patch_size", 2)) / effective_fps,
+                source_duration_seconds=source_duration,
+                truncated=truncated,
             )
         except Exception as error:
             logger.warning_rank0_once(
@@ -2146,7 +2162,9 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 max_length=int(max_audio_seconds * sampling_rate),
             )
         else:
-            kwargs["padding"] = "max_length"
+            # Match Qwen3OmniMoeProcessor: n_samples is a padding default, not
+            # an input-duration limit. AuT handles long audio in chunks.
+            kwargs.update(padding="longest", truncation=False)
         return kwargs
 
     def _audio_thinker_tokens(self, feature_frames: int, processor: "MMProcessor") -> int:
@@ -2170,7 +2188,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         max_samples = (
             int(custom_seconds * sampling_rate)
             if custom_seconds is not None
-            else getattr(feature_extractor, "n_samples", None)
+            else None
         )
         lossless_extensions = {".aif", ".aiff", ".flac", ".wav"}
         resolved: list[AudioTokenLayout | None] = [None] * len(audios)
@@ -2202,6 +2220,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             feature_frames = math.ceil(processed_samples / hop_length)
             resolved[index] = AudioTokenLayout(
                 input_samples=input_samples,
+                processed_samples=processed_samples,
                 sampling_rate=sampling_rate,
                 hop_length=hop_length,
                 feature_frames=feature_frames,
@@ -2219,6 +2238,9 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 input_samples = int(audio.shape[-1])
                 resolved[index] = AudioTokenLayout(
                     input_samples=input_samples,
+                    processed_samples=(
+                        min(input_samples, max_samples) if max_samples is not None else input_samples
+                    ),
                     sampling_rate=sampling_rate,
                     hop_length=hop_length,
                     feature_frames=int(feature_frames),

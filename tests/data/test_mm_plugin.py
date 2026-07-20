@@ -287,6 +287,55 @@ def test_qwen3_omni_lossless_audio_layout_honors_custom_cutoff(tmp_path):
     assert layout.truncated is True
 
 
+def test_qwen3_omni_audio_defaults_match_official_untruncated_processor():
+    processor = _layout_processor()
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+
+    kwargs = plugin._audio_feature_extractor_kwargs(processor)
+
+    assert kwargs["padding"] == "longest"
+    assert kwargs["truncation"] is False
+    assert "max_length" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("duration_seconds", "feature_frames", "thinker_tokens"),
+    [(1200, 120_000, 15_600), (2400, 240_000, 31_200)],
+)
+def test_qwen3_omni_long_audio_layout_is_not_capped_at_n_samples(
+    monkeypatch, duration_seconds, feature_frames, thinker_tokens
+):
+    class FakeAudioStream:
+        type = "audio"
+        duration = duration_seconds
+        time_base = Fraction(1, 1)
+
+    class FakeContainer:
+        streams = [FakeAudioStream()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(mm_plugin.av, "open", lambda *args, **kwargs: FakeContainer())
+    processor_class = type("Qwen3OmniMoeProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = None
+    processor.feature_extractor = SimpleNamespace(hop_length=160, n_samples=4_800_000)
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+
+    layout = plugin._get_audio_layouts(["long.wav"], processor)[0]
+
+    assert layout.input_samples == duration_seconds * 16000
+    assert layout.processed_samples == layout.input_samples
+    assert layout.feature_frames == feature_frames
+    assert layout.thinker_tokens == thinker_tokens
+    assert layout.truncated is False
+
+
 @pytest.mark.runs_on(["cpu", "mps"])
 def test_base_plugin():
     tokenizer_module = _load_tokenizer_module(model_name_or_path=TINY_LLAMA3)
