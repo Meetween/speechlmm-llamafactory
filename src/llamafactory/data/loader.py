@@ -25,6 +25,13 @@ from speechlmm.data_loading_optimization.sample_shapes import (
     SAMPLE_SHAPE_FEATURES,
     SOURCE_ID_COLUMN,
 )
+from speechlmm.data_loading_optimization.validation import (
+    REJECTED_SAMPLES_FILE,
+    quarantine_context_overflow,
+    rejected_samples_summary,
+    validate_dataset_media,
+    write_rejected_samples,
+)
 
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
@@ -381,6 +388,13 @@ def get_dataset(
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
+    if data_args.build_sample_shape_index:
+        resolved_limit = getattr(processor, "speechlmm_context_limit", None)
+        if resolved_limit is None or int(resolved_limit) != int(data_args.cutoff_len):
+            raise ValueError(
+                "prepared-data tokenization requires the model-derived context limit; "
+                "launch it through speechlmm.data.preprocess_dataset"
+            )
     if processor is not None and data_args.max_input_audio_seconds is not None:
         setattr(processor, "max_input_audio_seconds", data_args.max_input_audio_seconds)
 
@@ -454,6 +468,20 @@ def get_dataset(
                 return get_dataset_module(tokenized_data)
 
             train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+            preparation_rejections = []
+            if data_args.build_sample_shape_index:
+                for key, split in list(train_dict.items()):
+                    train_dict[key], rejected = validate_dataset_media(split, split=key)
+                    preparation_rejections.extend(rejected)
+                for key, split in list(eval_dict.items()):
+                    eval_dict[key], rejected = validate_dataset_media(split, split=key)
+                    preparation_rejections.extend(rejected)
+                if "train" in train_dict and len(train_dict["train"]) == 0:
+                    raise ValueError(
+                        "all training samples failed media validation: "
+                        f"{rejected_samples_summary(preparation_rejections)}"
+                    )
+
             resumable = data_args.preprocessing_resume and data_args.tokenized_path is not None and not data_args.packing
             if data_args.preprocessing_resume and data_args.tokenized_path is not None and data_args.packing:
                 logger.warning_rank0("Disabling resumable preprocessing because packing crosses shard boundaries.")
@@ -501,6 +529,19 @@ def get_dataset(
                         eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
                     )
 
+            if data_args.build_sample_shape_index:
+                for key, split in list(train_dict.items()):
+                    train_dict[key], rejected = quarantine_context_overflow(split, split=key)
+                    preparation_rejections.extend(rejected)
+                for key, split in list(eval_dict.items()):
+                    eval_dict[key], rejected = quarantine_context_overflow(split, split=key)
+                    preparation_rejections.extend(rejected)
+                if "train" in train_dict and len(train_dict["train"]) == 0:
+                    raise ValueError(
+                        "all training samples exceed the model context: "
+                        f"{rejected_samples_summary(preparation_rejections)}"
+                    )
+
             shape_index = None
             shape_summary = None
             if data_args.build_sample_shape_index:
@@ -522,11 +563,13 @@ def get_dataset(
                 preprocessing_fingerprint = get_preprocessing_fingerprint(
                     data_args, stage, template, tokenizer, processor, dataset_processor
                 )
+                preparation_summary = rejected_samples_summary(preparation_rejections)
                 shape_index, shape_summary = build_sample_shape_index_from_dataset(
                     dataset=tagged_train,
                     processor=processor,
                     preprocessing_fingerprint=preprocessing_fingerprint,
                     dataset_path=data_args.tokenized_path,
+                    preparation_summary=preparation_summary,
                 )
                 train_dict["train"] = tagged_train.remove_columns(list(TEMPORARY_SHAPE_COLUMNS))
                 for key, eval_split in eval_dict.items():
@@ -553,6 +596,10 @@ def get_dataset(
                             shape_index,
                             shape_summary,
                             assembly_path / relative_index_path,
+                        )
+                        write_rejected_samples(
+                            preparation_rejections,
+                            assembly_path / REJECTED_SAMPLES_FILE,
                         )
 
                     dataset_dict = finalize_resumable_dataset_dict(

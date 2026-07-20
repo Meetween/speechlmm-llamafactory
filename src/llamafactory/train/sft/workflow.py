@@ -22,6 +22,7 @@ from speechlmm.data_loading_optimization.integration import (
     build_dynamic_batch_plan,
     dynamic_plan_metrics,
 )
+from speechlmm.data_loading_optimization.limits import apply_model_derived_preparation_limits
 from speechlmm.memory_estimation.probing import configure_memory_probe, get_memory_probe, record_memory
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
@@ -30,7 +31,7 @@ from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
 from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
-from ...model import load_model, load_tokenizer
+from ...model import load_config, load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
@@ -81,6 +82,14 @@ def run_sft(
         )
 
     tokenizer_module = load_tokenizer(model_args)
+    if data_args.build_sample_shape_index or data_args.dynamic_batching:
+        apply_model_derived_preparation_limits(
+            config=load_config(model_args),
+            tokenizer=tokenizer_module["tokenizer"],
+            processor=tokenizer_module.get("processor"),
+            model_args=model_args,
+            data_args=data_args,
+        )
     record_memory("sft.after_load_tokenizer")
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)

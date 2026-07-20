@@ -18,7 +18,10 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from speechlmm.data_loading_optimization.sample_shapes import (
     AUDIO_LAYOUTS_COLUMN,
+    CONTEXT_LIMIT_COLUMN,
     IMAGE_LAYOUTS_COLUMN,
+    PRETRUNCATE_TARGET_TOKENS_COLUMN,
+    PRETRUNCATE_TOKENS_COLUMN,
     SAMPLE_ID_COLUMN,
     SOURCE_ID_COLUMN,
     VIDEO_LAYOUTS_COLUMN,
@@ -36,24 +39,32 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+@dataclass(frozen=True)
+class DataExampleLengthStats:
+    context_limit: int
+    pretruncate_thinker_tokens: int
+    pretruncate_valid_target_tokens: int
+
+
 @dataclass
 class SupervisedDatasetProcessor(DatasetProcessor):
-    def _build_data_example(
+    def _build_data_example_at_limit(
         self,
         input_ids: list[int],
         labels: list[int],
         encoded_pairs: list[tuple[list[int], list[int]]],
+        cutoff_len: int,
     ) -> tuple[list[int], list[int]]:
         total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
         if self.data_args.mask_history:
             encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
 
         for turn_idx, (source_ids, target_ids) in enumerate(encoded_pairs):
-            if total_length >= self.data_args.cutoff_len:
+            if total_length >= cutoff_len:
                 break
 
             source_len, target_len = infer_seqlen(
-                len(source_ids), len(target_ids), self.data_args.cutoff_len - total_length
+                len(source_ids), len(target_ids), cutoff_len - total_length
             )
             source_ids = source_ids[:source_len]
             target_ids = target_ids[:target_len]
@@ -84,6 +95,49 @@ class SupervisedDatasetProcessor(DatasetProcessor):
 
         return input_ids, labels
 
+    def _build_data_example(
+        self,
+        input_ids: list[int],
+        labels: list[int],
+        encoded_pairs: list[tuple[list[int], list[int]]],
+    ) -> tuple[list[int], list[int]]:
+        return self._build_data_example_at_limit(
+            input_ids,
+            labels,
+            encoded_pairs,
+            self.data_args.cutoff_len,
+        )
+
+    def _build_data_example_with_stats(
+        self,
+        input_ids: list[int],
+        labels: list[int],
+        encoded_pairs: list[tuple[list[int], list[int]]],
+    ) -> tuple[list[int], list[int], DataExampleLengthStats]:
+        full_limit = (
+            len(input_ids)
+            + sum(len(source_ids) + len(target_ids) for source_ids, target_ids in encoded_pairs)
+            + (1 if self.template.efficient_eos else 0)
+        )
+        full_input_ids, full_labels = self._build_data_example_at_limit(
+            list(input_ids),
+            list(labels),
+            encoded_pairs,
+            max(1, full_limit),
+        )
+        limited_input_ids, limited_labels = self._build_data_example_at_limit(
+            list(input_ids),
+            list(labels),
+            encoded_pairs,
+            self.data_args.cutoff_len,
+        )
+        stats = DataExampleLengthStats(
+            context_limit=self.data_args.cutoff_len,
+            pretruncate_thinker_tokens=len(full_input_ids),
+            pretruncate_valid_target_tokens=sum(token != IGNORE_INDEX for token in full_labels[1:]),
+        )
+        return limited_input_ids, limited_labels, stats
+
     def _encode_data_example(
         self,
         prompt: list[dict[str, str]],
@@ -103,7 +157,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
 
     def _encode_data_examples_batch(
         self, examples: dict[str, list[Any]]
-    ) -> list[tuple[int, list[int], list[int], Any]]:
+    ) -> list[tuple[int, list[int], list[int], DataExampleLengthStats, Any]]:
         pending_examples = []
         for index in range(len(examples["_prompt"])):
             if len(examples["_prompt"][index]) % 2 != 1 or len(examples["_response"][index]) != 1:
@@ -137,7 +191,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             [examples["_tools"][item[0]] for item in pending_examples],
         )
         return [
-            (index, *self._build_data_example(input_ids, labels, encoded_pairs), layouts)
+            (index, *self._build_data_example_with_stats(input_ids, labels, encoded_pairs), layouts)
             for (index, _messages, input_ids, labels, layouts), encoded_pairs in zip(
                 pending_examples, encoded_batch, strict=True
             )
@@ -147,7 +201,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         # build inputs with format `<bos> X Y <eos>` and labels with format `<ignore> ... <ignore> Y <eos>`
         # for multiturn examples, we only mask the prompt part in each prompt-response pair.
         model_inputs = defaultdict(list)
-        for i, input_ids, labels, layouts in self._encode_data_examples_batch(examples):
+        for i, input_ids, labels, stats, layouts in self._encode_data_examples_batch(examples):
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
@@ -164,6 +218,11 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 model_inputs[AUDIO_LAYOUTS_COLUMN].append([asdict(layout) for layout in layouts.audios])
                 model_inputs[IMAGE_LAYOUTS_COLUMN].append([asdict(layout) for layout in layouts.images])
                 model_inputs[VIDEO_LAYOUTS_COLUMN].append([asdict(layout) for layout in layouts.videos])
+                model_inputs[CONTEXT_LIMIT_COLUMN].append(stats.context_limit)
+                model_inputs[PRETRUNCATE_TOKENS_COLUMN].append(stats.pretruncate_thinker_tokens)
+                model_inputs[PRETRUNCATE_TARGET_TOKENS_COLUMN].append(
+                    stats.pretruncate_valid_target_tokens
+                )
 
         return model_inputs
 
@@ -185,7 +244,7 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
         batch_input_ids, batch_labels, batch_images, batch_videos, batch_audios = [], [], [], [], []
         lengths = []
         length2indexes = defaultdict(list)
-        for i, input_ids, labels, _layouts in self._encode_data_examples_batch(examples):
+        for i, input_ids, labels, _stats, _layouts in self._encode_data_examples_batch(examples):
             length = len(input_ids)
             if length > self.data_args.cutoff_len:
                 logger.warning_rank0(f"Dropped lengthy example with length {length} > {self.data_args.cutoff_len}.")
