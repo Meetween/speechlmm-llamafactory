@@ -72,10 +72,19 @@ class DataArguments(SpeechLMMDynamicBatchingArguments):
         default=16384,
         metadata={"help": "Size of the buffer to randomly sample examples from in dataset streaming."},
     )
-    mix_strategy: Literal["concat", "interleave_under", "interleave_over", "interleave_once"] = field(
+    mix_strategy: Literal[
+        "concat",
+        "interleave_under",
+        "interleave_over",
+        "interleave_once",
+        "interleave_anchored",
+    ] = field(
         default="concat",
         metadata={
-            "help": "Strategy to use in dataset mixing (concat/interleave) (undersampling/oversampling/sampling w.o. replacement)."
+            "help": (
+                "Strategy to use in dataset mixing (concat/interleave) "
+                "(undersampling/oversampling/anchored/sampling w.o. replacement)."
+            )
         },
     )
     interleave_probs: str | None = field(

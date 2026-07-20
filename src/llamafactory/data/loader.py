@@ -16,7 +16,7 @@ import os
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
@@ -192,6 +192,10 @@ def _get_merged_dataset(
 
     if return_dict:
         return datasets
+    elif data_args.dynamic_batching:
+        # Preserve every source row exactly once. The CPU planner owns all
+        # probability, exhaustion, and recycling semantics in dynamic mode.
+        return concatenate_datasets(list(datasets.values()))
     else:
         return merge_dataset(
             list(datasets.values()), data_args, seed=training_args.seed, interleave_probs=interleave_probs
