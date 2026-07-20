@@ -13,10 +13,18 @@
 # limitations under the License.
 
 import os
+from contextlib import nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from huggingface_hub.utils import WeakFileLock
+from speechlmm.data_loading_optimization.sample_shapes import (
+    SAMPLE_ID_COLUMN,
+    SAMPLE_SHAPE_FEATURES,
+    SOURCE_ID_COLUMN,
+)
 
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
@@ -31,6 +39,12 @@ from .processor import (
     PretrainDatasetProcessor,
     SupervisedDatasetProcessor,
     UnsupervisedDatasetProcessor,
+)
+from .resumable import (
+    finalize_resumable_dataset_dict,
+    get_preprocessing_fingerprint,
+    get_resume_lock_path,
+    process_dataset_in_resumable_shards,
 )
 
 
@@ -180,19 +194,19 @@ def _get_merged_dataset(
             raise ValueError("The dataset is not applicable in the current training stage.")
 
         dataset = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
-        if data_args.dynamic_batching:
-            reserved = {"_dynamic_source_id", "_dynamic_sample_id"} & set(dataset.column_names)
+        if data_args.build_sample_shape_index or data_args.dynamic_batching:
+            reserved = {SOURCE_ID_COLUMN, SAMPLE_ID_COLUMN} & set(dataset.column_names)
             if reserved:
-                raise ValueError(f"dataset {dataset_name!r} uses reserved dynamic batching columns: {reserved}")
-            dataset = dataset.add_column("_dynamic_source_id", [dataset_name] * len(dataset))
+                raise ValueError(f"dataset {dataset_name!r} uses reserved sample-shape columns: {reserved}")
+            dataset = dataset.add_column(SOURCE_ID_COLUMN, [dataset_name] * len(dataset))
             dataset = dataset.add_column(
-                "_dynamic_sample_id", [f"{dataset_name}:{index}" for index in range(len(dataset))]
+                SAMPLE_ID_COLUMN, [f"{dataset_name}:{index}" for index in range(len(dataset))]
             )
         datasets[dataset_name] = dataset
 
     if return_dict:
         return datasets
-    elif data_args.dynamic_batching:
+    elif data_args.build_sample_shape_index or data_args.dynamic_batching:
         # Preserve every source row exactly once. The CPU planner owns all
         # probability, exhaustion, and recycling semantics in dynamic mode.
         return concatenate_datasets(list(datasets.values()))
@@ -251,6 +265,8 @@ def _get_preprocessed_dataset(
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
     is_eval: bool = False,
+    print_example: bool = True,
+    keep_in_memory: bool = False,
 ) -> Union["Dataset", "IterableDataset"] | None:
     r"""Preprocesses the dataset, including format checking and tokenization."""
     if dataset is None:
@@ -265,6 +281,7 @@ def _get_preprocessed_dataset(
         kwargs = dict(
             num_proc=data_args.preprocessing_num_workers,
             load_from_cache_file=(not data_args.overwrite_cache) or (training_args.local_process_index != 0),
+            keep_in_memory=keep_in_memory,
             desc="Running tokenizer on dataset",
         )
 
@@ -276,7 +293,11 @@ def _get_preprocessed_dataset(
         **kwargs,
     )
 
-    if training_args.should_log:
+    if data_args.build_sample_shape_index:
+        for column_name, feature in SAMPLE_SHAPE_FEATURES.items():
+            dataset = dataset.cast_column(column_name, feature)
+
+    if training_args.should_log and print_example:
         try:
             print("eval example:" if is_eval else "training example:")
             dataset_processor.print_data_example(next(iter(dataset)))
@@ -287,6 +308,67 @@ def _get_preprocessed_dataset(
                 raise RuntimeError("Cannot find valid samples, check `data/README.md` for the data format.")
 
     return dataset
+
+
+def _get_resumable_preprocessed_dataset(
+    dataset: "Dataset",
+    split_name: str,
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    template: "Template",
+    tokenizer: "PreTrainedTokenizer",
+    processor: Optional["ProcessorMixin"] = None,
+    is_eval: bool = False,
+) -> "Dataset":
+    if data_args.tokenized_path is None:
+        raise ValueError("tokenized_path is required for resumable preprocessing")
+
+    dataset_processor = _get_dataset_processor(
+        data_args,
+        stage,
+        template,
+        tokenizer,
+        processor,
+        do_generate=(training_args.predict_with_generate and is_eval),
+    )
+    preprocessing_fingerprint = get_preprocessing_fingerprint(
+        data_args,
+        stage,
+        template,
+        tokenizer,
+        processor,
+        dataset_processor,
+    )
+    processed_dataset = process_dataset_in_resumable_shards(
+        dataset=dataset,
+        process_shard=lambda shard: _get_preprocessed_dataset(
+            shard,
+            data_args,
+            training_args,
+            stage,
+            template,
+            tokenizer,
+            processor,
+            is_eval,
+            print_example=False,
+            keep_in_memory=True,
+        ),
+        output_path=data_args.tokenized_path,
+        split_name=split_name,
+        shard_size=data_args.preprocessing_shard_size,
+        preprocessing_fingerprint=preprocessing_fingerprint,
+    )
+
+    if training_args.should_log:
+        try:
+            print("eval example:" if is_eval else "training example:")
+            dataset_processor.print_data_example(next(iter(processed_dataset)))
+        except StopIteration:
+            if stage == "pt":
+                raise RuntimeError("Cannot find sufficient samples, consider increasing dataset size.")
+            raise RuntimeError("Cannot find valid samples, check `data/README.md` for the data format.")
+    return processed_dataset
 
 
 def get_dataset(
@@ -305,6 +387,11 @@ def get_dataset(
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:
         if has_tokenized_data(data_args.tokenized_path):
+            if data_args.build_sample_shape_index and not Path(data_args.sample_shape_index_path).is_dir():
+                raise ValueError(
+                    "tokenized data already exists but its requested sample-shape index is missing; "
+                    "use a new tokenized_path or restore the complete prepared artifact"
+                )
             logger.warning_rank0("Loading dataset from disk will ignore other data arguments.")
             tokenized_data = load_from_disk(data_args.tokenized_path)
             dataset_module = get_dataset_module(tokenized_data)
@@ -316,6 +403,14 @@ def get_dataset(
 
         if data_args.streaming:
             raise ValueError("Turn off `streaming` when saving dataset to disk.")
+
+    if data_args.dynamic_batching:
+        raise ValueError(
+            "dynamic batching requires a previously tokenized dataset and sample-shape index; "
+            "run speechlmm.data.preprocess_dataset first"
+        )
+    if data_args.build_sample_shape_index and stage != "sft":
+        raise ValueError("sample-shape index building currently supports supervised fine-tuning data only")
 
     # Load and preprocess dataset
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
@@ -346,70 +441,131 @@ def get_dataset(
             interleave_probs=eval_interleave_probs,
         )
 
+    output_lock = (
+        WeakFileLock(get_resume_lock_path(data_args.tokenized_path))
+        if data_args.preprocessing_resume and data_args.tokenized_path is not None
+        else nullcontext()
+    )
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
-        # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
-        train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+        with output_lock:
+            if data_args.tokenized_path is not None and has_tokenized_data(data_args.tokenized_path):
+                tokenized_data = load_from_disk(data_args.tokenized_path)
+                logger.info_rank0(f"Loaded tokenized dataset from {data_args.tokenized_path}.")
+                return get_dataset_module(tokenized_data)
 
-        if "train" in train_dict:
-            train_dict["train"] = _get_preprocessed_dataset(
-                train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
-            )
+            train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+            resumable = data_args.preprocessing_resume and data_args.tokenized_path is not None and not data_args.packing
+            if data_args.preprocessing_resume and data_args.tokenized_path is not None and data_args.packing:
+                logger.warning_rank0("Disabling resumable preprocessing because packing crosses shard boundaries.")
 
-        for key in eval_dict:
-            eval_dict[key] = _get_preprocessed_dataset(
-                eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
-            )
+            if "train" in train_dict:
+                if resumable:
+                    train_dict["train"] = _get_resumable_preprocessed_dataset(
+                        train_dict["train"],
+                        "train",
+                        data_args,
+                        training_args,
+                        stage,
+                        template,
+                        tokenizer,
+                        processor,
+                        is_eval=False,
+                    )
+                else:
+                    train_dict["train"] = _get_preprocessed_dataset(
+                        train_dict["train"],
+                        data_args,
+                        training_args,
+                        stage,
+                        template,
+                        tokenizer,
+                        processor,
+                        is_eval=False,
+                    )
 
-        # Combine train and eval dictionaries
-        if data_args.dynamic_batching:
-            from speechlmm.data_loading_optimization import (
-                build_batching_index_from_dataset,
-                load_batching_memory_profile,
-                write_batching_index,
-            )
+            for key in eval_dict:
+                if resumable:
+                    eval_dict[key] = _get_resumable_preprocessed_dataset(
+                        eval_dict[key],
+                        key,
+                        data_args,
+                        training_args,
+                        stage,
+                        template,
+                        tokenizer,
+                        processor,
+                        is_eval=True,
+                    )
+                else:
+                    eval_dict[key] = _get_preprocessed_dataset(
+                        eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+                    )
 
-            tagged_train = train_dict.get("train")
-            if tagged_train is None:
-                raise ValueError("dynamic batching requires a training split")
-            temporary_columns = [
-                name
-                for name in ("_dynamic_source_id", "_dynamic_sample_id")
-                if name in tagged_train.column_names
-            ]
-            if len(temporary_columns) != 2:
-                raise ValueError("dynamic batching source provenance was lost during tokenization")
-            clean_train = tagged_train.remove_columns(temporary_columns)
-            if training_args.should_save:
-                loaded_profile = load_batching_memory_profile(data_args.dynamic_batching_memory_profile)
-                batching_index, batching_summary = build_batching_index_from_dataset(
+            shape_index = None
+            shape_summary = None
+            if data_args.build_sample_shape_index:
+                from speechlmm.data_loading_optimization import (
+                    TEMPORARY_SHAPE_COLUMNS,
+                    build_sample_shape_index_from_dataset,
+                    write_sample_shape_index,
+                )
+
+                tagged_train = train_dict.get("train")
+                if tagged_train is None:
+                    raise ValueError("sample-shape index building requires a training split")
+                missing = set(TEMPORARY_SHAPE_COLUMNS) - set(tagged_train.column_names)
+                if missing:
+                    raise ValueError(f"sample geometry was lost during tokenization: {sorted(missing)}")
+                dataset_processor = _get_dataset_processor(
+                    data_args, stage, template, tokenizer, processor, do_generate=False
+                )
+                preprocessing_fingerprint = get_preprocessing_fingerprint(
+                    data_args, stage, template, tokenizer, processor, dataset_processor
+                )
+                shape_index, shape_summary = build_sample_shape_index_from_dataset(
                     dataset=tagged_train,
-                    profile=loaded_profile.profile,
-                    shape_profile_fingerprint=loaded_profile.shape_fingerprint,
-                    source_id_column="_dynamic_source_id",
-                    sample_id_column="_dynamic_sample_id",
-                    media_root=data_args.media_dir,
-                    image_min_pixels=getattr(processor, "image_min_pixels", 32 * 32),
-                    image_max_pixels=getattr(processor, "image_max_pixels", 768 * 768),
+                    processor=processor,
+                    preprocessing_fingerprint=preprocessing_fingerprint,
                     dataset_path=data_args.tokenized_path,
                 )
-                write_batching_index(
-                    batching_index, batching_summary, data_args.dynamic_batching_index
-                )
-                logger.info_rank0(
-                    f"Dynamic batching index is saved at {data_args.dynamic_batching_index}."
-                )
-            train_dict["train"] = clean_train
-            for key, eval_split in eval_dict.items():
-                removable = [name for name in temporary_columns if name in eval_split.column_names]
-                if removable:
-                    eval_dict[key] = eval_split.remove_columns(removable)
+                train_dict["train"] = tagged_train.remove_columns(list(TEMPORARY_SHAPE_COLUMNS))
+                for key, eval_split in eval_dict.items():
+                    removable = [name for name in TEMPORARY_SHAPE_COLUMNS if name in eval_split.column_names]
+                    if removable:
+                        eval_dict[key] = eval_split.remove_columns(removable)
 
-        dataset_dict = DatasetDict({**train_dict, **eval_dict})
+            dataset_dict = DatasetDict({**train_dict, **eval_dict})
+            if data_args.tokenized_path is not None and training_args.should_save:
+                if shape_index is not None:
+                    output_root = Path(data_args.tokenized_path).resolve()
+                    index_path = Path(data_args.sample_shape_index_path).resolve()
+                    try:
+                        relative_index_path = index_path.relative_to(output_root)
+                    except ValueError as error:
+                        raise ValueError(
+                            "sample_shape_index_path must be inside tokenized_path so both artifacts publish atomically"
+                        ) from error
+                    if relative_index_path == Path("."):
+                        raise ValueError("sample_shape_index_path must be a child of tokenized_path")
 
-        if data_args.tokenized_path is not None:  # save tokenized dataset to disk
-            if training_args.should_save:
-                dataset_dict.save_to_disk(data_args.tokenized_path)
+                    def prepare_assembly(assembly_path: Path) -> None:
+                        write_sample_shape_index(
+                            shape_index,
+                            shape_summary,
+                            assembly_path / relative_index_path,
+                        )
+
+                    dataset_dict = finalize_resumable_dataset_dict(
+                        dataset_dict,
+                        data_args.tokenized_path,
+                        prepare_assembly=prepare_assembly,
+                    )
+                    logger.info_rank0(f"Sample-shape index is saved at {data_args.sample_shape_index_path}.")
+                elif resumable:
+                    dataset_dict = finalize_resumable_dataset_dict(dataset_dict, data_args.tokenized_path)
+                else:
+                    dataset_dict.save_to_disk(data_args.tokenized_path)
                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
 
-        return get_dataset_module(dataset_dict)
+            return get_dataset_module(dataset_dict)
