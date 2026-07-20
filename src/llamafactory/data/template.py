@@ -83,6 +83,49 @@ class Template:
         encoded_messages = self._encode(tokenizer, messages, system, tools)
         return [(encoded_messages[i], encoded_messages[i + 1]) for i in range(0, len(encoded_messages), 2)]
 
+    def encode_multiturn_batch(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        batch_messages: list[list[dict[str, str]]],
+        systems: list[Optional[str]],
+        tools: list[Optional[str]],
+    ) -> list[list[tuple[list[int], list[int]]]]:
+        r"""Encode conversations with one batched tokenizer call."""
+        if len(batch_messages) != len(systems) or len(batch_messages) != len(tools):
+            raise ValueError("Messages, systems, and tools must contain the same number of conversations.")
+
+        batch_elements = [
+            self._format_messages(messages, system, tool)
+            for messages, system, tool in zip(batch_messages, systems, tools, strict=True)
+        ]
+        strings = [
+            element
+            for message_elements in batch_elements
+            for elements in message_elements
+            for element in elements
+            if isinstance(element, str) and element
+        ]
+        encoded_strings = iter(
+            tokenizer(strings, add_special_tokens=False, padding=False)["input_ids"] if strings else []
+        )
+
+        encoded_batch = []
+        for message_elements in batch_elements:
+            encoded_messages = []
+            for elements in message_elements:
+                encoded_ids = []
+                for element in elements:
+                    if isinstance(element, str):
+                        if element:
+                            encoded_ids += next(encoded_strings)
+                    else:
+                        encoded_ids += self._convert_elements_to_ids(tokenizer, [element])
+                encoded_messages.append(encoded_ids)
+            encoded_batch.append(
+                [(encoded_messages[index], encoded_messages[index + 1]) for index in range(0, len(encoded_messages), 2)]
+            )
+        return encoded_batch
+
     def extract_tool(self, content: str) -> Union[str, list["FunctionCall"]]:
         r"""Extract tool message."""
         return self.format_tools.extract(content)
@@ -127,20 +170,19 @@ class Template:
 
         return token_ids
 
-    def _encode(
+    def _format_messages(
         self,
-        tokenizer: "PreTrainedTokenizer",
         messages: list[dict[str, str]],
         system: Optional[str],
         tools: Optional[str],
-    ) -> list[list[int]]:
-        r"""Encode formatted inputs to pairs of token ids.
+    ) -> list["SLOTS"]:
+        r"""Format messages into tokenizer-ready slots.
 
         Turn 0: prefix + system + query        resp
         Turn t: query                          resp.
         """
         system = system or self.default_system
-        encoded_messages = []
+        formatted_messages = []
         for i, message in enumerate(messages):
             elements = []
 
@@ -163,9 +205,22 @@ class Template:
             else:
                 raise NotImplementedError("Unexpected role: {}".format(message["role"]))
 
-            encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
+            formatted_messages.append(elements)
 
-        return encoded_messages
+        return formatted_messages
+
+    def _encode(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str],
+        tools: Optional[str],
+    ) -> list[list[int]]:
+        r"""Encode formatted inputs to pairs of token ids."""
+        return [
+            self._convert_elements_to_ids(tokenizer, elements)
+            for elements in self._format_messages(messages, system, tools)
+        ]
 
     @staticmethod
     def _add_or_replace_eos_token(tokenizer: "PreTrainedTokenizer", eos_token: str) -> None:
@@ -336,15 +391,14 @@ class Llama2Template(Template):
     r"""A template that fuse the system message to first user message."""
 
     @override
-    def _encode(
+    def _format_messages(
         self,
-        tokenizer: "PreTrainedTokenizer",
         messages: list[dict[str, str]],
         system: str,
         tools: str,
-    ) -> list[list[int]]:
+    ) -> list["SLOTS"]:
         system = system or self.default_system
-        encoded_messages = []
+        formatted_messages = []
         for i, message in enumerate(messages):
             elements = []
 
@@ -366,9 +420,9 @@ class Llama2Template(Template):
             else:
                 raise NotImplementedError("Unexpected role: {}".format(message["role"]))
 
-            encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
+            formatted_messages.append(elements)
 
-        return encoded_messages
+        return formatted_messages
 
     def _get_jinja_template(self, tokenizer: "PreTrainedTokenizer") -> str:
         prefix = self._convert_slots_to_jinja(self.format_prefix.apply(), tokenizer)
@@ -404,6 +458,34 @@ class Llama2Template(Template):
 @dataclass
 class ReasoningTemplate(Template):
     r"""A template that add thought to assistant message."""
+
+    @override
+    def encode_multiturn_batch(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        batch_messages: list[list[dict[str, str]]],
+        systems: list[Optional[str]],
+        tools: list[Optional[str]],
+    ) -> list[list[tuple[list[int], list[int]]]]:
+        processed_messages = []
+        for messages in batch_messages:
+            messages = deepcopy(messages)
+            if self.enable_thinking is False:
+                for index in range(1, len(messages), 2):
+                    messages[index]["content"] = self.remove_thought(messages[index]["content"])
+            processed_messages.append(messages)
+
+        encoded_batch = super().encode_multiturn_batch(tokenizer, processed_messages, systems, tools)
+        thought_ids = self.get_thought_word_ids(tokenizer)
+        for messages, encoded_pairs in zip(processed_messages, encoded_batch, strict=True):
+            for turn_index, (_, target_ids) in enumerate(encoded_pairs):
+                response = messages[turn_index * 2 + 1]["content"]
+                if self.thought_words[0].strip() not in response and self.thought_words[1].strip() not in response:
+                    if not self.enable_thinking:
+                        encoded_pairs[turn_index] = (encoded_pairs[turn_index][0] + thought_ids, target_ids)
+                    else:
+                        encoded_pairs[turn_index] = (encoded_pairs[turn_index][0], thought_ids + target_ids)
+        return encoded_batch
 
     @override
     def encode_oneturn(

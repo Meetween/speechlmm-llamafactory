@@ -13,8 +13,16 @@
 # limitations under the License.
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Optional
+
+from speechlmm.data_loading_optimization.sample_shapes import (
+    AUDIO_LAYOUTS_COLUMN,
+    IMAGE_LAYOUTS_COLUMN,
+    SAMPLE_ID_COLUMN,
+    SOURCE_ID_COLUMN,
+    VIDEO_LAYOUTS_COLUMN,
+)
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
@@ -30,21 +38,12 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class SupervisedDatasetProcessor(DatasetProcessor):
-    def _encode_data_example(
+    def _build_data_example(
         self,
-        prompt: list[dict[str, str]],
-        response: list[dict[str, str]],
-        system: Optional[str],
-        tools: Optional[str],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        input_ids: list[int],
+        labels: list[int],
+        encoded_pairs: list[tuple[list[int], list[int]]],
     ) -> tuple[list[int], list[int]]:
-        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
-        input_ids, labels = self.template.mm_plugin.process_token_ids(
-            [], [], images, videos, audios, self.tokenizer, self.processor
-        )
-        encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
         total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
         if self.data_args.mask_history:
             encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
@@ -85,26 +84,70 @@ class SupervisedDatasetProcessor(DatasetProcessor):
 
         return input_ids, labels
 
+    def _encode_data_example(
+        self,
+        prompt: list[dict[str, str]],
+        response: list[dict[str, str]],
+        system: Optional[str],
+        tools: Optional[str],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+    ) -> tuple[list[int], list[int]]:
+        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+        input_ids, labels = self.template.mm_plugin.process_token_ids(
+            [], [], images, videos, audios, self.tokenizer, self.processor
+        )
+        encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
+        return self._build_data_example(input_ids, labels, encoded_pairs)
+
+    def _encode_data_examples_batch(
+        self, examples: dict[str, list[Any]]
+    ) -> list[tuple[int, list[int], list[int], Any]]:
+        pending_examples = []
+        for index in range(len(examples["_prompt"])):
+            if len(examples["_prompt"][index]) % 2 != 1 or len(examples["_response"][index]) != 1:
+                logger.warning_rank0(
+                    "Dropped invalid example: {}".format(examples["_prompt"][index] + examples["_response"][index])
+                )
+                continue
+
+            images = examples["_images"][index] or []
+            videos = examples["_videos"][index] or []
+            audios = examples["_audios"][index] or []
+            raw_messages = examples["_prompt"][index] + examples["_response"][index]
+            if self.data_args.build_sample_shape_index:
+                messages, layouts = self.template.mm_plugin.process_messages_with_layout(
+                    raw_messages, images, videos, audios, self.processor
+                )
+            else:
+                messages = self.template.mm_plugin.process_messages(
+                    raw_messages, images, videos, audios, self.processor
+                )
+                layouts = None
+            input_ids, labels = self.template.mm_plugin.process_token_ids(
+                [], [], images, videos, audios, self.tokenizer, self.processor
+            )
+            pending_examples.append((index, messages, input_ids, labels, layouts))
+
+        encoded_batch = self.template.encode_multiturn_batch(
+            self.tokenizer,
+            [item[1] for item in pending_examples],
+            [examples["_system"][item[0]] for item in pending_examples],
+            [examples["_tools"][item[0]] for item in pending_examples],
+        )
+        return [
+            (index, *self._build_data_example(input_ids, labels, encoded_pairs), layouts)
+            for (index, _messages, input_ids, labels, layouts), encoded_pairs in zip(
+                pending_examples, encoded_batch, strict=True
+            )
+        ]
+
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         # build inputs with format `<bos> X Y <eos>` and labels with format `<ignore> ... <ignore> Y <eos>`
         # for multiturn examples, we only mask the prompt part in each prompt-response pair.
         model_inputs = defaultdict(list)
-        for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
-                logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
-                )
-                continue
-
-            input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
-                tools=examples["_tools"][i],
-                images=examples["_images"][i] or [],
-                videos=examples["_videos"][i] or [],
-                audios=examples["_audios"][i] or [],
-            )
+        for i, input_ids, labels, layouts in self._encode_data_examples_batch(examples):
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
@@ -113,10 +156,14 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["audios"].append(examples["_audios"][i])
             codec_tokens = examples.get("_codec_tokens", [None] * len(examples["_prompt"]))
             model_inputs["codec_tokens"].append(codec_tokens[i])
-            if "_dynamic_source_id" in examples:
-                model_inputs["_dynamic_source_id"].append(examples["_dynamic_source_id"][i])
-            if "_dynamic_sample_id" in examples:
-                model_inputs["_dynamic_sample_id"].append(examples["_dynamic_sample_id"][i])
+            if SOURCE_ID_COLUMN in examples:
+                model_inputs[SOURCE_ID_COLUMN].append(examples[SOURCE_ID_COLUMN][i])
+            if SAMPLE_ID_COLUMN in examples:
+                model_inputs[SAMPLE_ID_COLUMN].append(examples[SAMPLE_ID_COLUMN][i])
+            if layouts is not None:
+                model_inputs[AUDIO_LAYOUTS_COLUMN].append([asdict(layout) for layout in layouts.audios])
+                model_inputs[IMAGE_LAYOUTS_COLUMN].append([asdict(layout) for layout in layouts.images])
+                model_inputs[VIDEO_LAYOUTS_COLUMN].append([asdict(layout) for layout in layouts.videos])
 
         return model_inputs
 
@@ -138,22 +185,7 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
         batch_input_ids, batch_labels, batch_images, batch_videos, batch_audios = [], [], [], [], []
         lengths = []
         length2indexes = defaultdict(list)
-        for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
-                logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
-                )
-                continue
-
-            input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
-                tools=examples["_tools"][i],
-                images=examples["_images"][i] or [],
-                videos=examples["_videos"][i] or [],
-                audios=examples["_audios"][i] or [],
-            )
+        for i, input_ids, labels, _layouts in self._encode_data_examples_batch(examples):
             length = len(input_ids)
             if length > self.data_args.cutoff_len:
                 logger.warning_rank0(f"Dropped lengthy example with length {length} > {self.data_args.cutoff_len}.")
