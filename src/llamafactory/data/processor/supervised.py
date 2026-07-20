@@ -39,8 +39,18 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         images: list["ImageInput"],
         videos: list["VideoInput"],
         audios: list["AudioInput"],
+        lipread: list["VideoInput"],
     ) -> tuple[list[int], list[int]]:
-        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+
+        lipread_kwargs: dict = {"lipread": lipread} if lipread else {}
+        messages = self.template.mm_plugin.process_messages(
+            prompt + response,
+            images,
+            videos,
+            audios,
+            self.processor,
+            **lipread_kwargs,
+        )
         input_ids, labels = self.template.mm_plugin.process_token_ids(
             [], [], images, videos, audios, self.tokenizer, self.processor
         )
@@ -104,6 +114,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],
                 audios=examples["_audios"][i] or [],
+                lipread=examples["_lipread"][i] or [],
             )
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
@@ -111,6 +122,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["images"].append(examples["_images"][i])
             model_inputs["videos"].append(examples["_videos"][i])
             model_inputs["audios"].append(examples["_audios"][i])
+            model_inputs["lipread"].append(examples["_lipread"][i])
             codec_tokens = examples.get("_codec_tokens", [None] * len(examples["_prompt"]))
             model_inputs["codec_tokens"].append(codec_tokens[i])
 
@@ -149,6 +161,7 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],
                 audios=examples["_audios"][i] or [],
+                lipread=examples["_lipread"][i] or [],
             )
             length = len(input_ids)
             if length > self.data_args.cutoff_len:

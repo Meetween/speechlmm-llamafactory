@@ -100,7 +100,7 @@ def patch_tokenizer(tokenizer: "PreTrainedTokenizer", model_args: "ModelArgument
         logger.info_rank0(
             "Add special tokens {} to tokenizer's vocabulary.".format(",".join(model_args.add_special_tokens))
         )
-        if num_added_special_tokens > 0 and not model_args.resize_vocab:
+        if num_added_special_tokens > 0 and not model_args.resize_vocab and not model_args.use_speechlmm_wrapper:
             model_args.resize_vocab = True
             logger.warning_rank0("New special tokens have been added, changed `resize_vocab` to True.")
 

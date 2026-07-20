@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from peft import PeftModel
 from transformers import DataCollatorForSeq2Seq
 
+from speechlmm.tokens import LIPREAD_FRAME_SIZE
+
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
 
@@ -165,17 +167,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             self.get_rope_func = None
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
-        batch_images, batch_videos, batch_audios = [], [], []
+        batch_images, batch_videos, batch_audios, batch_lipread = [], [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         batch_codec_tokens: list[list[int] | None] = []
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+            lipread = feature.pop("lipread", None) or []
             codec_tokens = feature.pop("codec_tokens", None)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
+            batch_lipread.extend(lipread)
             batch_imglens.append(len(images))
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
@@ -236,6 +240,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_audlens,
             batch_input_ids,
             self.processor,
+            lipread=batch_lipread,
         )
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
@@ -323,6 +328,20 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                     padded_codec.append(ct + [IGNORE_INDEX] * (max_codec_len - len(ct)))
             features["codec_labels"] = torch.tensor(padded_codec, dtype=torch.long)
 
+        if len(batch_lipread) > 0:
+            lipread = features["lipread"]
+            lengths = [x.shape[0] for x in lipread]
+            max_length = max(lengths)
+            n_lipread = len(lipread)
+            lipread_padded = torch.zeros((n_lipread, max_length, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE))
+            lipread_mask = torch.zeros((n_lipread, max_length, max_length), dtype=torch.uint8)
+
+            for i in range(n_lipread):
+                lipread_padded[i, : lengths[i]] = lipread[i][:, 0, :, :]
+                lipread_mask[i, : lengths[i], : lengths[i]] = 1
+
+            features["lipread"] = lipread_padded
+            features["lipread_mask"] = lipread_mask
         return features
 
 

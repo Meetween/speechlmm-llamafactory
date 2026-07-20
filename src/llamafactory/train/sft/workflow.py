@@ -18,6 +18,8 @@
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
+from speechlmm.tokens import build_speechlmm_special_tokens
+
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
@@ -46,6 +48,19 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    needs_lipread_tokens = model_args.use_speechlmm_wrapper or (
+        data_args.template == "speechlmm"
+        and (
+            not finetuning_args.freeze_lipread_encoder
+            or not finetuning_args.freeze_lipread_adapter
+        )
+    )
+    if needs_lipread_tokens:
+        original_add_special_tokens = getattr(model_args, "add_special_tokens", None) or []
+        model_args.add_special_tokens = original_add_special_tokens + build_speechlmm_special_tokens(
+            model_args
+        )
+
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
