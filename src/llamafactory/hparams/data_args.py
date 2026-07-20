@@ -15,14 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-from speechlmm.training.hparams import SpeechLMMDynamicBatchingArguments
+from speechlmm.training.hparams import SpeechLMMDataPreparationArguments, SpeechLMMDynamicBatchingArguments
 
 
 @dataclass
-class DataArguments(SpeechLMMDynamicBatchingArguments):
+class DataArguments(SpeechLMMDataPreparationArguments, SpeechLMMDynamicBatchingArguments):
     r"""Arguments pertaining to what data we are going to input our model for training and evaluation."""
 
     template: str | None = field(
@@ -110,6 +111,14 @@ class DataArguments(SpeechLMMDynamicBatchingArguments):
     preprocessing_num_workers: int | None = field(
         default=None,
         metadata={"help": "The number of processes to use for the pre-processing."},
+    )
+    preprocessing_resume: bool = field(
+        default=True,
+        metadata={"help": "Save preprocessing shards so interrupted tokenization can resume."},
+    )
+    preprocessing_shard_size: int = field(
+        default=50000,
+        metadata={"help": "Number of source rows in each resumable preprocessing shard."},
     )
     max_samples: int | None = field(
         default=None,
@@ -214,6 +223,26 @@ class DataArguments(SpeechLMMDynamicBatchingArguments):
 
         if self.neat_packing:
             self.packing = True
+
+        if self.preprocessing_shard_size <= 0:
+            raise ValueError("`preprocessing_shard_size` must be greater than zero.")
+
+        if self.build_sample_shape_index:
+            if self.tokenized_path is None:
+                raise ValueError("build_sample_shape_index requires tokenized_path")
+            if not self.sample_shape_index_path:
+                self.sample_shape_index_path = os.path.join(self.tokenized_path, "sample_shapes")
+            if self.streaming:
+                raise ValueError("sample-shape index building does not support streaming datasets")
+            if self.packing:
+                raise ValueError("sample-shape index building does not support sequence packing")
+            if self.mix_strategy != "concat" or self.interleave_probs is not None:
+                raise ValueError(
+                    "sample-shape tokenization is independent of training mixing; "
+                    "use mix_strategy=concat and omit interleave_probs"
+                )
+            if self.dynamic_batching:
+                raise ValueError("build the sample-shape index before enabling dynamic_batching training")
 
         if self.packing:
             self.cutoff_len -= 1  # avoid pad_to_multiple_of, needs improve

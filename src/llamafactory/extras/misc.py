@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import gc
+import json
 import os
 import socket
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
@@ -235,7 +236,33 @@ def get_peak_memory() -> tuple[int, int]:
 
 def has_tokenized_data(path: "os.PathLike") -> bool:
     r"""Check if the path has a tokenized dataset."""
-    return os.path.isdir(path) and len(os.listdir(path)) > 0
+    if not os.path.isdir(path):
+        return False
+
+    def has_dataset(dataset_path: "os.PathLike") -> bool:
+        state_path = os.path.join(dataset_path, "state.json")
+        info_path = os.path.join(dataset_path, "dataset_info.json")
+        if not os.path.isfile(state_path) or not os.path.isfile(info_path):
+            return False
+        try:
+            with open(state_path, encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            return all(
+                os.path.isfile(os.path.join(dataset_path, data_file["filename"]))
+                for data_file in state["_data_files"]
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+    dataset_dict_path = os.path.join(path, "dataset_dict.json")
+    if not os.path.isfile(dataset_dict_path):
+        return has_dataset(path)
+    try:
+        with open(dataset_dict_path, encoding="utf-8") as dataset_dict_file:
+            splits = json.load(dataset_dict_file)["splits"]
+        return len(splits) > 0 and all(has_dataset(os.path.join(path, split)) for split in splits)
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def infer_optim_dtype(model_dtype: Optional["torch.dtype"]) -> "torch.dtype":
