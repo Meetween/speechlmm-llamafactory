@@ -1,4 +1,6 @@
 import json
+import multiprocessing
+import os
 
 import pytest
 from datasets import Dataset, DatasetDict, load_from_disk
@@ -13,6 +15,24 @@ from llamafactory.extras.misc import has_tokenized_data
 
 def _add_doubled_column(dataset: Dataset) -> Dataset:
     return dataset.map(lambda batch: {"doubled": [value * 2 for value in batch["value"]]}, batched=True)
+
+
+def _terminate_during_second_shard(output_path: str) -> None:
+    source = Dataset.from_dict({"value": list(range(6))})
+
+    def terminate(shard: Dataset) -> Dataset:
+        if shard[0]["value"] == 2:
+            os._exit(17)
+        return _add_doubled_column(shard)
+
+    process_dataset_in_resumable_shards(
+        source,
+        terminate,
+        output_path,
+        "train",
+        shard_size=2,
+        preprocessing_fingerprint="process-death-test",
+    )
 
 
 def test_resumable_preprocessing_skips_completed_shards(tmp_path):
@@ -58,6 +78,37 @@ def test_resumable_preprocessing_skips_completed_shards(tmp_path):
     assert resumed_starts == [4, 8]
     assert processed["value"] == list(range(10))
     assert processed["doubled"] == [value * 2 for value in range(10)]
+
+
+def test_resumable_preprocessing_survives_process_death(tmp_path):
+    output_path = tmp_path / "tokenized"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_terminate_during_second_shard,
+        args=(str(output_path),),
+    )
+    process.start()
+    process.join(timeout=30)
+
+    assert process.exitcode == 17
+    resume_path = get_resume_path(output_path)
+    assert (resume_path / "train" / "shard-00000-of-00003" / "resume_shard.json").is_file()
+    resumed_starts = []
+
+    def record(shard):
+        resumed_starts.append(shard[0]["value"])
+        return _add_doubled_column(shard)
+
+    resumed = process_dataset_in_resumable_shards(
+        Dataset.from_dict({"value": list(range(6))}),
+        record,
+        output_path,
+        "train",
+        shard_size=2,
+        preprocessing_fingerprint="process-death-test",
+    )
+
+    assert resumed_starts == [2, 4]
+    assert resumed["doubled"] == [0, 2, 4, 6, 8, 10]
 
 
 def test_resumable_preprocessing_rejects_changed_configuration(tmp_path):
@@ -184,6 +235,35 @@ def test_resumable_finalization_materializes_transformed_view_and_callback(tmp_p
     assert loaded["train"].column_names == ["value"]
     assert loaded["train"]["value"] == list(range(5))
     assert (output_path / "sample_shapes" / "manifest.json").is_file()
+
+
+def test_resumable_finalization_recovers_after_sidecar_failure(tmp_path):
+    source = Dataset.from_dict({"value": list(range(4))})
+    output_path = tmp_path / "tokenized"
+    processed = process_dataset_in_resumable_shards(
+        source,
+        _add_doubled_column,
+        output_path,
+        "train",
+        shard_size=2,
+        preprocessing_fingerprint="publication-failure-test",
+    )
+
+    def fail_sidecar(_assembly_path):
+        raise RuntimeError("simulated sidecar failure")
+
+    with pytest.raises(RuntimeError, match="simulated sidecar failure"):
+        finalize_resumable_dataset_dict(
+            DatasetDict({"train": processed}),
+            output_path,
+            prepare_assembly=fail_sidecar,
+        )
+
+    assert not output_path.exists()
+    assert not (tmp_path / "tokenized.assembling").exists()
+    assert get_resume_path(output_path).exists()
+    finalized = finalize_resumable_dataset_dict(DatasetDict({"train": processed}), output_path)
+    assert finalized["train"]["value"] == list(range(4))
 
 
 def test_has_tokenized_data_rejects_incomplete_dataset_dict(tmp_path):

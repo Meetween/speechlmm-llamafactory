@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 from contextlib import nullcontext
 from pathlib import Path
@@ -39,6 +40,11 @@ from ..extras.misc import check_version, has_tokenized_data
 from .converter import align_dataset
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset
 from .parser import get_dataset_list
+from .preparation_errors import (
+    PROCESSING_ERROR_COLUMN,
+    PreprocessedDatasetResult,
+    deserialize_error,
+)
 from .processor import (
     FeedbackDatasetProcessor,
     PackedSupervisedDatasetProcessor,
@@ -48,6 +54,7 @@ from .processor import (
     UnsupervisedDatasetProcessor,
 )
 from .resumable import (
+    ResumableDatasetResult,
     finalize_resumable_dataset_dict,
     get_preprocessing_fingerprint,
     get_resume_lock_path,
@@ -68,9 +75,18 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+PREPARED_MEDIA_BATCH_SIZE = 32
+PREPARED_MEDIA_MAX_WORKERS = 4
+PREPARED_AUDIO_SHARD_SIZE = 1000
+
+
+def _contains_media(dataset: "Dataset", column_name: str) -> bool:
+    return column_name in dataset.column_names and dataset.data.column(column_name).null_count < len(dataset)
+
 
 def _load_single_dataset(
     dataset_attr: "DatasetAttr",
+    source_name: str,
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
@@ -163,12 +179,27 @@ def _load_single_dataset(
         if data_args.streaming and dataset_attr.load_from == "file":
             dataset = dataset.to_iterable_dataset(num_shards=training_args.dataloader_num_workers)
 
+    if data_args.build_sample_shape_index:
+        reserved = {SOURCE_ID_COLUMN, SAMPLE_ID_COLUMN} & set(dataset.column_names)
+        if reserved:
+            raise ValueError(f"dataset {source_name!r} uses reserved sample-shape columns: {reserved}")
+        dataset = dataset.add_column(SOURCE_ID_COLUMN, [source_name] * len(dataset))
+        dataset = dataset.add_column(
+            SAMPLE_ID_COLUMN,
+            [f"{source_name}:{index}" for index in range(len(dataset))],
+        )
+
     if dataset_attr.num_samples is not None and not data_args.streaming:
+        sampling_seed = int.from_bytes(
+            hashlib.sha256(f"{training_args.seed}:{source_name}".encode()).digest()[:8],
+            "big",
+        )
+        rng = np.random.default_rng(sampling_seed)
         target_num = dataset_attr.num_samples
-        indexes = np.random.permutation(len(dataset))[:target_num]  # all samples should be included
+        indexes = rng.permutation(len(dataset))[:target_num]  # all samples should be included
         target_num -= len(indexes)
         if target_num > 0:
-            expand_indexes = np.random.choice(len(dataset), target_num)
+            expand_indexes = rng.choice(len(dataset), target_num)
             indexes = np.concatenate((indexes, expand_indexes), axis=0)
 
         assert len(indexes) == dataset_attr.num_samples, "Sample num mismatched."
@@ -200,15 +231,20 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        dataset = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        dataset = _load_single_dataset(dataset_attr, dataset_name, model_args, data_args, training_args)
         if data_args.build_sample_shape_index or data_args.dynamic_batching:
-            reserved = {SOURCE_ID_COLUMN, SAMPLE_ID_COLUMN} & set(dataset.column_names)
-            if reserved:
-                raise ValueError(f"dataset {dataset_name!r} uses reserved sample-shape columns: {reserved}")
-            dataset = dataset.add_column(SOURCE_ID_COLUMN, [dataset_name] * len(dataset))
-            dataset = dataset.add_column(
-                SAMPLE_ID_COLUMN, [f"{dataset_name}:{index}" for index in range(len(dataset))]
-            )
+            identity_columns = {SOURCE_ID_COLUMN, SAMPLE_ID_COLUMN} & set(dataset.column_names)
+            if not identity_columns:
+                dataset = dataset.add_column(SOURCE_ID_COLUMN, [dataset_name] * len(dataset))
+                dataset = dataset.add_column(
+                    SAMPLE_ID_COLUMN,
+                    [f"{dataset_name}:{index}" for index in range(len(dataset))],
+                )
+            elif identity_columns != {SOURCE_ID_COLUMN, SAMPLE_ID_COLUMN}:
+                raise ValueError(
+                    f"dataset {dataset_name!r} has incomplete sample identity columns: {identity_columns}"
+                )
+
         datasets[dataset_name] = dataset
 
     if return_dict:
@@ -274,7 +310,8 @@ def _get_preprocessed_dataset(
     is_eval: bool = False,
     print_example: bool = True,
     keep_in_memory: bool = False,
-) -> Union["Dataset", "IterableDataset"] | None:
+    return_result: bool = False,
+) -> Union["Dataset", "IterableDataset", "PreprocessedDatasetResult"] | None:
     r"""Preprocesses the dataset, including format checking and tokenization."""
     if dataset is None:
         return None
@@ -285,8 +322,21 @@ def _get_preprocessed_dataset(
     column_names = list(next(iter(dataset)).keys())
     kwargs = {}
     if not data_args.streaming:
+        batch_size = data_args.preprocessing_batch_size
+        num_proc = data_args.preprocessing_num_workers
+        if data_args.build_sample_shape_index and any(
+            _contains_media(dataset, column) for column in ("_images", "_videos", "_audios")
+        ):
+            batch_size = min(batch_size, PREPARED_MEDIA_BATCH_SIZE)
+            if num_proc is not None:
+                num_proc = min(num_proc, PREPARED_MEDIA_MAX_WORKERS)
+            if batch_size != data_args.preprocessing_batch_size or num_proc != data_args.preprocessing_num_workers:
+                logger.warning_rank0_once(
+                    "Prepared multimodal tokenization bounds each map batch to "
+                    f"{batch_size} rows and preprocessing workers to {num_proc} to control host memory."
+                )
         kwargs = dict(
-            num_proc=data_args.preprocessing_num_workers,
+            num_proc=num_proc,
             load_from_cache_file=(not data_args.overwrite_cache) or (training_args.local_process_index != 0),
             keep_in_memory=keep_in_memory,
             desc="Running tokenizer on dataset",
@@ -295,12 +345,17 @@ def _get_preprocessed_dataset(
     dataset = dataset.map(
         dataset_processor.preprocess_dataset,
         batched=True,
-        batch_size=data_args.preprocessing_batch_size,
+        batch_size=(batch_size if not data_args.streaming else data_args.preprocessing_batch_size),
         remove_columns=column_names,
         **kwargs,
     )
 
+    rejected_samples = []
     if data_args.build_sample_shape_index:
+        errors = dataset[PROCESSING_ERROR_COLUMN]
+        rejected_samples = [deserialize_error(error) for error in errors if error is not None]
+        valid_indices = [index for index, error in enumerate(errors) if error is None]
+        dataset = dataset.select(valid_indices).remove_columns(PROCESSING_ERROR_COLUMN)
         for column_name, feature in SAMPLE_SHAPE_FEATURES.items():
             dataset = dataset.cast_column(column_name, feature)
 
@@ -314,6 +369,8 @@ def _get_preprocessed_dataset(
             else:
                 raise RuntimeError("Cannot find valid samples, check `data/README.md` for the data format.")
 
+    if return_result:
+        return PreprocessedDatasetResult(dataset=dataset, rejected_samples=rejected_samples)
     return dataset
 
 
@@ -327,7 +384,7 @@ def _get_resumable_preprocessed_dataset(
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
     is_eval: bool = False,
-) -> "Dataset":
+) -> "ResumableDatasetResult":
     if data_args.tokenized_path is None:
         raise ValueError("tokenized_path is required for resumable preprocessing")
 
@@ -347,7 +404,15 @@ def _get_resumable_preprocessed_dataset(
         processor,
         dataset_processor,
     )
-    processed_dataset = process_dataset_in_resumable_shards(
+    shard_size = data_args.preprocessing_shard_size
+    if data_args.build_sample_shape_index and _contains_media(dataset, "_audios"):
+        shard_size = min(shard_size, PREPARED_AUDIO_SHARD_SIZE)
+        if shard_size != data_args.preprocessing_shard_size:
+            logger.warning_rank0_once(
+                f"Prepared audio tokenization uses {shard_size}-row resume shards to limit replay and host memory."
+            )
+
+    result = process_dataset_in_resumable_shards(
         dataset=dataset,
         process_shard=lambda shard: _get_preprocessed_dataset(
             shard,
@@ -359,23 +424,70 @@ def _get_resumable_preprocessed_dataset(
             processor,
             is_eval,
             print_example=False,
-            keep_in_memory=True,
+            keep_in_memory=False,
+            return_result=data_args.build_sample_shape_index,
         ),
         output_path=data_args.tokenized_path,
         split_name=split_name,
-        shard_size=data_args.preprocessing_shard_size,
+        shard_size=shard_size,
         preprocessing_fingerprint=preprocessing_fingerprint,
+        return_result=True,
+        require_row_accounting=data_args.build_sample_shape_index,
     )
+    if not isinstance(result, ResumableDatasetResult):
+        raise TypeError("resumable prepared-data processing did not return its summary")
 
     if training_args.should_log:
         try:
             print("eval example:" if is_eval else "training example:")
-            dataset_processor.print_data_example(next(iter(processed_dataset)))
+            dataset_processor.print_data_example(next(iter(result.dataset)))
         except StopIteration:
             if stage == "pt":
                 raise RuntimeError("Cannot find sufficient samples, consider increasing dataset size.")
             raise RuntimeError("Cannot find valid samples, check `data/README.md` for the data format.")
-    return processed_dataset
+    return result
+
+
+def _validate_completed_prepared_data(
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    template: "Template",
+    tokenizer: "PreTrainedTokenizer",
+    processor: Optional["ProcessorMixin"],
+) -> None:
+    if not data_args.build_sample_shape_index:
+        return
+    if not Path(data_args.sample_shape_index_path).is_dir():
+        raise ValueError(
+            "tokenized data already exists but its requested sample-shape index is missing; "
+            "use a new tokenized_path or restore the complete prepared artifact"
+        )
+
+    from speechlmm.data_loading_optimization import load_sample_shape_index
+
+    dataset_processor = _get_dataset_processor(
+        data_args,
+        stage,
+        template,
+        tokenizer,
+        processor,
+        do_generate=training_args.predict_with_generate,
+    )
+    current_fingerprint = get_preprocessing_fingerprint(
+        data_args,
+        stage,
+        template,
+        tokenizer,
+        processor,
+        dataset_processor,
+    )
+    completed_index = load_sample_shape_index(data_args.sample_shape_index_path)
+    if completed_index.preprocessing_fingerprint != current_fingerprint:
+        raise ValueError(
+            "completed prepared data was built with different tokenizer, processor, template, "
+            "or preprocessing semantics; use a new tokenized_path"
+        )
 
 
 def get_dataset(
@@ -401,11 +513,7 @@ def get_dataset(
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:
         if has_tokenized_data(data_args.tokenized_path):
-            if data_args.build_sample_shape_index and not Path(data_args.sample_shape_index_path).is_dir():
-                raise ValueError(
-                    "tokenized data already exists but its requested sample-shape index is missing; "
-                    "use a new tokenized_path or restore the complete prepared artifact"
-                )
+            _validate_completed_prepared_data(data_args, training_args, stage, template, tokenizer, processor)
             logger.warning_rank0("Loading dataset from disk will ignore other data arguments.")
             tokenized_data = load_from_disk(data_args.tokenized_path)
             dataset_module = get_dataset_module(tokenized_data)
@@ -463,12 +571,16 @@ def get_dataset(
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
         with output_lock:
             if data_args.tokenized_path is not None and has_tokenized_data(data_args.tokenized_path):
+                _validate_completed_prepared_data(data_args, training_args, stage, template, tokenizer, processor)
                 tokenized_data = load_from_disk(data_args.tokenized_path)
                 logger.info_rank0(f"Loaded tokenized dataset from {data_args.tokenized_path}.")
                 return get_dataset_module(tokenized_data)
 
             train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
             preparation_rejections = []
+            preparation_source_rows = sum(len(split) for split in train_dict.values()) + sum(
+                len(split) for split in eval_dict.values()
+            )
             if data_args.build_sample_shape_index:
                 for key, split in list(train_dict.items()):
                     train_dict[key], rejected = validate_dataset_media(split, split=key)
@@ -482,13 +594,15 @@ def get_dataset(
                         f"{rejected_samples_summary(preparation_rejections)}"
                     )
 
-            resumable = data_args.preprocessing_resume and data_args.tokenized_path is not None and not data_args.packing
+            resumable = (
+                data_args.preprocessing_resume and data_args.tokenized_path is not None and not data_args.packing
+            )
             if data_args.preprocessing_resume and data_args.tokenized_path is not None and data_args.packing:
                 logger.warning_rank0("Disabling resumable preprocessing because packing crosses shard boundaries.")
 
             if "train" in train_dict:
                 if resumable:
-                    train_dict["train"] = _get_resumable_preprocessed_dataset(
+                    result = _get_resumable_preprocessed_dataset(
                         train_dict["train"],
                         "train",
                         data_args,
@@ -499,8 +613,10 @@ def get_dataset(
                         processor,
                         is_eval=False,
                     )
+                    train_dict["train"] = result.dataset
+                    preparation_rejections.extend(result.rejected_samples)
                 else:
-                    train_dict["train"] = _get_preprocessed_dataset(
+                    result = _get_preprocessed_dataset(
                         train_dict["train"],
                         data_args,
                         training_args,
@@ -509,11 +625,19 @@ def get_dataset(
                         tokenizer,
                         processor,
                         is_eval=False,
+                        return_result=data_args.build_sample_shape_index,
                     )
+                    if isinstance(result, PreprocessedDatasetResult):
+                        train_dict["train"] = result.dataset
+                        preparation_rejections.extend(
+                            {**record, "split": "train"} for record in result.rejected_samples
+                        )
+                    else:
+                        train_dict["train"] = result
 
             for key in eval_dict:
                 if resumable:
-                    eval_dict[key] = _get_resumable_preprocessed_dataset(
+                    result = _get_resumable_preprocessed_dataset(
                         eval_dict[key],
                         key,
                         data_args,
@@ -524,10 +648,25 @@ def get_dataset(
                         processor,
                         is_eval=True,
                     )
+                    eval_dict[key] = result.dataset
+                    preparation_rejections.extend(result.rejected_samples)
                 else:
-                    eval_dict[key] = _get_preprocessed_dataset(
-                        eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+                    result = _get_preprocessed_dataset(
+                        eval_dict[key],
+                        data_args,
+                        training_args,
+                        stage,
+                        template,
+                        tokenizer,
+                        processor,
+                        is_eval=True,
+                        return_result=data_args.build_sample_shape_index,
                     )
+                    if isinstance(result, PreprocessedDatasetResult):
+                        eval_dict[key] = result.dataset
+                        preparation_rejections.extend({**record, "split": key} for record in result.rejected_samples)
+                    else:
+                        eval_dict[key] = result
 
             if data_args.build_sample_shape_index:
                 for key, split in list(train_dict.items()):
@@ -540,6 +679,34 @@ def get_dataset(
                     raise ValueError(
                         "all training samples exceed the model context: "
                         f"{rejected_samples_summary(preparation_rejections)}"
+                    )
+
+                output_rows = sum(len(split) for split in train_dict.values()) + sum(
+                    len(split) for split in eval_dict.values()
+                )
+                if preparation_source_rows != output_rows + len(preparation_rejections):
+                    raise RuntimeError(
+                        "prepared-data row accounting failed: "
+                        f"source={preparation_source_rows}, output={output_rows}, "
+                        f"rejected={len(preparation_rejections)}"
+                    )
+                if (
+                    data_args.preprocessing_max_failed_samples is not None
+                    and len(preparation_rejections) > data_args.preprocessing_max_failed_samples
+                ):
+                    raise RuntimeError(
+                        f"preparation rejected {len(preparation_rejections)} rows, exceeding "
+                        f"preprocessing_max_failed_samples={data_args.preprocessing_max_failed_samples}"
+                    )
+                if (
+                    data_args.preprocessing_max_failed_fraction is not None
+                    and len(preparation_rejections)
+                    > data_args.preprocessing_max_failed_fraction * preparation_source_rows
+                ):
+                    raise RuntimeError(
+                        f"preparation rejected {len(preparation_rejections)}/{preparation_source_rows} rows, "
+                        "exceeding preprocessing_max_failed_fraction="
+                        f"{data_args.preprocessing_max_failed_fraction}"
                     )
 
             shape_index = None

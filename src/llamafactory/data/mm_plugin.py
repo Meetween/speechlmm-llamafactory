@@ -38,6 +38,7 @@ from typing_extensions import override
 from ..extras import logging
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+from .preparation_errors import is_resource_exhaustion_error, raise_recoverable_preparation_error
 
 
 if is_pillow_available():
@@ -1623,11 +1624,16 @@ class Qwen2VLPlugin(BasePlugin):
                 seconds_per_grid=0.0,
             )
         except Exception as error:
+            if is_resource_exhaustion_error(error):
+                raise
             logger.warning_rank0_once(
                 "Image metadata was insufficient for placeholder expansion; falling back to full image decoding."
             )
             logger.debug(f"Image placeholder fast path failed: {error}")
-            grid = self._get_mm_inputs([image], [], [], processor)["image_grid_thw"][0]
+            try:
+                grid = self._get_mm_inputs([image], [], [], processor)["image_grid_thw"][0]
+            except (OSError, RuntimeError, ValueError) as fallback_error:
+                raise_recoverable_preparation_error(fallback_error, "image_placeholder_expansion")
             merge_size = int(getattr(image_processor, "merge_size"))
             grid_t, grid_h, grid_w = (int(value) for value in grid)
             return VisualTokenLayout(
@@ -1673,9 +1679,7 @@ class Qwen2VLPlugin(BasePlugin):
                         sample_count = len(
                             self._get_video_sample_indices(stream, video_fps=video_fps, video_maxlen=video_maxlen)
                         )
-                        desired_samples = min(
-                            int(stream.frames), max(1, math.floor(duration * video_fps))
-                        )
+                        desired_samples = min(int(stream.frames), max(1, math.floor(duration * video_fps)))
                         width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0))
                         height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0))
                         effective_fps = sample_count / duration
@@ -1706,11 +1710,16 @@ class Qwen2VLPlugin(BasePlugin):
                 truncated=truncated,
             )
         except Exception as error:
+            if is_resource_exhaustion_error(error):
+                raise
             logger.warning_rank0_once(
                 "Video metadata was insufficient for placeholder expansion; falling back to full video decoding."
             )
             logger.debug(f"Video placeholder fast path failed: {error}")
-            mm_inputs = self._get_mm_inputs([], [video], [], processor)
+            try:
+                mm_inputs = self._get_mm_inputs([], [video], [], processor)
+            except (OSError, RuntimeError, ValueError) as fallback_error:
+                raise_recoverable_preparation_error(fallback_error, "video_placeholder_expansion")
             grid = mm_inputs["video_grid_thw"][0]
             grid_t, grid_h, grid_w = (int(value) for value in grid)
             merge_size = int(getattr(video_processor, "merge_size"))
@@ -2147,10 +2156,13 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 truncation=True,
                 max_length=int(max_audio_seconds * sampling_rate),
             )
-        else:
-            # Match Qwen3OmniMoeProcessor: n_samples is a padding default, not
-            # an input-duration limit. AuT handles long audio in chunks.
+        elif processor.__class__.__name__ == "Qwen3OmniMoeProcessor":
+            # Qwen3's AuT encoder handles long audio in chunks. Here n_samples
+            # is a feature-extractor default, not an input-duration limit.
             kwargs.update(padding="longest", truncation=False)
+        else:
+            # Preserve the Qwen2.5-Omni processor contract.
+            kwargs["padding"] = "max_length"
         return kwargs
 
     def _audio_thinker_tokens(self, feature_frames: int, processor: "MMProcessor") -> int:
@@ -2166,17 +2178,12 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         audios: list["AudioInput"],
         processor: "MMProcessor",
     ) -> tuple[AudioTokenLayout, ...]:
-        """Resolve audio feature lengths without decoding supported lossless files."""
+        """Resolve audio feature lengths from container metadata before decoding."""
         feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor")
         sampling_rate = int(getattr(processor, "audio_sampling_rate", 16000))
         hop_length = int(getattr(feature_extractor, "hop_length", 160))
         custom_seconds = getattr(processor, "max_input_audio_seconds", None)
-        max_samples = (
-            int(custom_seconds * sampling_rate)
-            if custom_seconds is not None
-            else None
-        )
-        lossless_extensions = {".aif", ".aiff", ".flac", ".wav"}
+        max_samples = int(custom_seconds * sampling_rate) if custom_seconds is not None else None
         resolved: list[AudioTokenLayout | None] = [None] * len(audios)
         fallback_audios: list[AudioInput] = []
         fallback_indices: list[int] = []
@@ -2185,13 +2192,15 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             input_samples = None
             if isinstance(audio, np.ndarray):
                 input_samples = int(audio.shape[-1])
-            elif isinstance(audio, str) and os.path.splitext(audio)[1].lower() in lossless_extensions:
+            elif isinstance(audio, str):
                 try:
                     with av.open(audio, "r") as container:
                         stream = next(candidate for candidate in container.streams if candidate.type == "audio")
                         if stream.duration is not None and stream.time_base is not None:
                             input_samples = math.ceil(float(stream.duration * stream.time_base) * sampling_rate)
                 except Exception as error:
+                    if is_resource_exhaustion_error(error):
+                        raise
                     logger.warning_rank0_once(
                         "Audio metadata was insufficient for placeholder expansion; falling back to audio decoding."
                     )
@@ -2215,18 +2224,17 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             )
 
         if fallback_audios:
-            regularized = self._regularize_audios(fallback_audios, sampling_rate=sampling_rate)["audios"]
-            fallback_inputs = feature_extractor(regularized, **self._audio_feature_extractor_kwargs(processor))
+            try:
+                regularized = self._regularize_audios(fallback_audios, sampling_rate=sampling_rate)["audios"]
+                fallback_inputs = feature_extractor(regularized, **self._audio_feature_extractor_kwargs(processor))
+            except (OSError, RuntimeError, ValueError) as error:
+                raise_recoverable_preparation_error(error, "audio_placeholder_expansion")
             feature_lengths = fallback_inputs["attention_mask"].sum(-1).tolist()
-            for index, audio, feature_frames in zip(
-                fallback_indices, regularized, feature_lengths, strict=True
-            ):
+            for index, audio, feature_frames in zip(fallback_indices, regularized, feature_lengths, strict=True):
                 input_samples = int(audio.shape[-1])
                 resolved[index] = AudioTokenLayout(
                     input_samples=input_samples,
-                    processed_samples=(
-                        min(input_samples, max_samples) if max_samples is not None else input_samples
-                    ),
+                    processed_samples=(min(input_samples, max_samples) if max_samples is not None else input_samples),
                     sampling_rate=sampling_rate,
                     hop_length=hop_length,
                     feature_frames=int(feature_frames),

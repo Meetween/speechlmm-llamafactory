@@ -226,6 +226,10 @@ class DataArguments(SpeechLMMDataPreparationArguments, SpeechLMMDynamicBatchingA
 
         if self.preprocessing_shard_size <= 0:
             raise ValueError("`preprocessing_shard_size` must be greater than zero.")
+        if self.preprocessing_max_failed_samples is not None and self.preprocessing_max_failed_samples < 0:
+            raise ValueError("preprocessing_max_failed_samples must be non-negative")
+        if self.preprocessing_max_failed_fraction is not None and not 0 <= self.preprocessing_max_failed_fraction <= 1:
+            raise ValueError("preprocessing_max_failed_fraction must be between zero and one")
 
         if self.build_sample_shape_index:
             if self.tokenized_path is None:

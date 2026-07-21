@@ -17,8 +17,11 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Union
 
+from speechlmm.data_loading_optimization.sample_shapes import SAMPLE_ID_COLUMN, SOURCE_ID_COLUMN
+
 from ..extras import logging
 from .data_utils import Role
+from .preparation_errors import ALIGNMENT_ERROR_COLUMN, serialize_alignment_error
 
 
 if TYPE_CHECKING:
@@ -421,8 +424,34 @@ def align_dataset(
         )
 
     dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
+
+    def convert_example(example: dict[str, Any]) -> dict[str, Any]:
+        alignment_error = None
+        try:
+            converted = dataset_converter(example)
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            if not data_args.build_sample_shape_index:
+                raise
+            alignment_error = serialize_alignment_error(error)
+            converted = {
+                "_prompt": [],
+                "_response": [],
+                "_system": "",
+                "_tools": "",
+                "_images": None,
+                "_videos": None,
+                "_audios": None,
+                "_codec_tokens": None,
+            }
+
+        if data_args.build_sample_shape_index:
+            converted[SOURCE_ID_COLUMN] = example[SOURCE_ID_COLUMN]
+            converted[SAMPLE_ID_COLUMN] = example[SAMPLE_ID_COLUMN]
+            converted[ALIGNMENT_ERROR_COLUMN] = alignment_error
+        return converted
+
     return dataset.map(
-        dataset_converter,
+        convert_example,
         batched=False,
         remove_columns=column_names,
         **kwargs,
