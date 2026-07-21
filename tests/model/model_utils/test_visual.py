@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 
 import pytest
 import torch
@@ -21,7 +22,15 @@ from transformers import AutoConfig, AutoModelForImageTextToText
 
 from llamafactory.extras.packages import is_transformers_version_greater_than
 from llamafactory.hparams import FinetuningArguments, ModelArguments
-from llamafactory.model.adapter import init_adapter
+from llamafactory.model.adapter import _exact_target_module_pattern, init_adapter
+
+
+def test_exact_composite_lora_target_does_not_match_talker_suffix():
+    target = "model.layers.0.self_attn.q_proj"
+    pattern = _exact_target_module_pattern([target])
+
+    assert re.fullmatch(pattern, target)
+    assert re.fullmatch(pattern, f"talker.{target}") is None
 
 
 @pytest.mark.parametrize("freeze_vision_tower", (False, True))
