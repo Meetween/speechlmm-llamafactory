@@ -288,7 +288,10 @@ def test_qwen3_omni_lossless_audio_layout_honors_custom_cutoff(tmp_path):
 
 
 def test_qwen3_omni_audio_defaults_match_official_untruncated_processor():
-    processor = _layout_processor()
+    processor_class = type("Qwen3OmniMoeProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = None
     plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
 
     kwargs = plugin._audio_feature_extractor_kwargs(processor)
@@ -298,9 +301,32 @@ def test_qwen3_omni_audio_defaults_match_official_untruncated_processor():
     assert "max_length" not in kwargs
 
 
+def test_qwen2_5_omni_audio_defaults_preserve_fixed_processor_shape():
+    processor_class = type("Qwen2_5OmniProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = None
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+
+    kwargs = plugin._audio_feature_extractor_kwargs(processor)
+
+    assert kwargs["padding"] == "max_length"
+    assert "truncation" not in kwargs
+
+
 @pytest.mark.parametrize(
     ("duration_seconds", "feature_frames", "thinker_tokens"),
-    [(1200, 120_000, 15_600), (2400, 240_000, 31_200)],
+    [
+        (1, 100, 13),
+        (29, 2_900, 377),
+        (30, 3_000, 390),
+        (31, 3_100, 403),
+        (299, 29_900, 3_887),
+        (300, 30_000, 3_900),
+        (301, 30_100, 3_913),
+        (1200, 120_000, 15_600),
+        (2400, 240_000, 31_200),
+    ],
 )
 def test_qwen3_omni_long_audio_layout_is_not_capped_at_n_samples(
     monkeypatch, duration_seconds, feature_frames, thinker_tokens
@@ -334,6 +360,60 @@ def test_qwen3_omni_long_audio_layout_is_not_capped_at_n_samples(
     assert layout.feature_frames == feature_frames
     assert layout.thinker_tokens == thinker_tokens
     assert layout.truncated is False
+
+
+def test_qwen3_omni_compressed_audio_layout_uses_container_metadata(monkeypatch):
+    class FakeAudioStream:
+        type = "audio"
+        duration = 600
+        time_base = 1
+
+    class FakeContainer:
+        streams = [FakeAudioStream()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    processor_class = type("Qwen3OmniMoeProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = None
+    processor.feature_extractor = SimpleNamespace(hop_length=160, n_samples=480000)
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+    monkeypatch.setattr(mm_plugin.av, "open", lambda *args, **kwargs: FakeContainer())
+    monkeypatch.setattr(
+        plugin,
+        "_regularize_audios",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not decode MP3")),
+    )
+
+    layout = plugin._get_audio_layouts(["chapter.mp3"], processor)[0]
+
+    assert layout.input_samples == 9_600_000
+    assert layout.feature_frames == 60_000
+    assert layout.thinker_tokens == 7_800
+    assert layout.truncated is False
+
+
+def test_qwen3_omni_audio_metadata_oom_is_not_treated_as_a_decode_fallback(monkeypatch):
+    processor_class = type("Qwen3OmniMoeProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = None
+    processor.feature_extractor = SimpleNamespace(hop_length=160, n_samples=480000)
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+    monkeypatch.setattr(mm_plugin.av, "open", lambda *args, **kwargs: (_ for _ in ()).throw(MemoryError("oom")))
+    monkeypatch.setattr(
+        plugin,
+        "_regularize_audios",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not decode after OOM")),
+    )
+
+    with pytest.raises(MemoryError, match="oom"):
+        plugin._get_audio_layouts(["chapter.mp3"], processor)
 
 
 @pytest.mark.runs_on(["cpu", "mps"])

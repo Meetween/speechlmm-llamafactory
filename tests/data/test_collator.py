@@ -117,11 +117,11 @@ def test_multimodal_collator():
             [0, 1, 2, 3, q, q, q, q, q, q, q, q],
         ],
         "position_ids": [
-            [[0, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1]],
-            [[0, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1]],
-            [[0, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1]],
+            [[0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0]],
+            [[0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0]],
+            [[0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0]],
         ],
-        "rope_deltas": [[-8]],
+        "rope_deltas": [[0]],
         **tokenizer_module["processor"].image_processor(fake_image),
     }
     assert batch_input.keys() == expected_input.keys()

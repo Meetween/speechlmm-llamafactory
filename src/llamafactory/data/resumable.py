@@ -20,7 +20,7 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import asdict as dataclass_asdict
-from dataclasses import is_dataclass
+from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -29,6 +29,8 @@ from datasets import __version__ as datasets_version
 from transformers import __version__ as transformers_version
 
 from ..extras import logging
+from . import preparation_errors
+from .preparation_errors import PreprocessedDatasetResult
 
 
 if TYPE_CHECKING:
@@ -41,11 +43,19 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-RESUME_FORMAT_VERSION = 2
+RESUME_FORMAT_VERSION = 3
 RESUME_SUFFIX = ".inprogress"
 ASSEMBLY_SUFFIX = ".assembling"
 SHARD_METADATA_FILE = "resume_shard.json"
+SHARD_REJECTIONS_FILE = "preparation_rejected_samples.jsonl"
 MEDIA_COLUMNS = ("_images", "_videos", "_audios")
+
+
+@dataclass
+class ResumableDatasetResult:
+    dataset: Dataset
+    rejected_samples: list[dict[str, Any]]
+    source_rows: int
 
 
 def _jsonable(value: Any) -> Any:
@@ -78,12 +88,16 @@ def _get_implementation_digest(*objects: object) -> str:
     implementation_files = {os.path.abspath(__file__): {__name__}}
     for obj in objects:
         try:
-            source_file = inspect.getsourcefile(type(obj))
+            if inspect.ismodule(obj):
+                source_file = inspect.getsourcefile(obj)
+                identifier = obj.__name__
+            else:
+                source_file = inspect.getsourcefile(type(obj))
+                identifier = f"{type(obj).__module__}.{type(obj).__qualname__}"
         except (TypeError, OSError):
             source_file = None
         if source_file is not None:
             source_file = os.path.abspath(source_file)
-            identifier = f"{type(obj).__module__}.{type(obj).__qualname__}"
             implementation_files.setdefault(source_file, set()).add(identifier)
 
     digest = hashlib.sha256()
@@ -105,9 +119,7 @@ def _get_tokenizer_semantics_digest(tokenizer: "PreTrainedTokenizer") -> str:
     if backend is not None and hasattr(backend, "to_str"):
         digest.update(backend.to_str().encode("utf-8"))
     else:
-        digest.update(
-            json.dumps(tokenizer.get_vocab(), sort_keys=True, separators=(",", ":")).encode("utf-8")
-        )
+        digest.update(json.dumps(tokenizer.get_vocab(), sort_keys=True, separators=(",", ":")).encode("utf-8"))
     digest.update(str(getattr(tokenizer, "chat_template", None)).encode("utf-8"))
     value = digest.hexdigest()
     setattr(tokenizer, "_speechlmm_semantics_digest", value)
@@ -130,6 +142,8 @@ def get_preprocessing_fingerprint(
         "preprocessing_num_workers",
         "preprocessing_resume",
         "preprocessing_shard_size",
+        "preprocessing_max_failed_samples",
+        "preprocessing_max_failed_fraction",
         "tokenized_path",
         "sample_shape_index_path",
         "dynamic_batching",
@@ -169,7 +183,12 @@ def get_preprocessing_fingerprint(
             "processor": processor_config,
             "datasets_version": datasets_version,
             "transformers_version": transformers_version,
-            "implementation": _get_implementation_digest(dataset_processor, template, template.mm_plugin),
+            "implementation": _get_implementation_digest(
+                dataset_processor,
+                template,
+                template.mm_plugin,
+                preparation_errors,
+            ),
         }
     )
 
@@ -249,7 +268,26 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
-def _load_completed_shard(shard_path: Path, expected_metadata: dict[str, Any]) -> Dataset | None:
+def _serialize_jsonl(records: list[dict[str, Any]]) -> bytes:
+    lines = [json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True) for record in records]
+    return (("\n".join(lines) + "\n") if lines else "").encode("utf-8")
+
+
+def _write_bytes_atomic(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output_file:
+            output_file.write(value)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_name, path)
+    except Exception:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def _load_completed_shard(shard_path: Path, expected_metadata: dict[str, Any]) -> PreprocessedDatasetResult | None:
     metadata_path = shard_path / SHARD_METADATA_FILE
     if not shard_path.exists():
         return None
@@ -271,7 +309,13 @@ def _load_completed_shard(shard_path: Path, expected_metadata: dict[str, Any]) -
         dataset = load_from_disk(str(shard_path))
         if len(dataset) != metadata["output_rows"]:
             raise ValueError("Saved shard row count does not match its completion metadata.")
-        return dataset
+        rejection_content = (shard_path / SHARD_REJECTIONS_FILE).read_bytes()
+        if hashlib.sha256(rejection_content).hexdigest() != metadata["rejections_sha256"]:
+            raise ValueError("Saved shard rejection records do not match completion metadata.")
+        rejected_samples = [json.loads(line) for line in rejection_content.decode("utf-8").splitlines() if line]
+        if len(rejected_samples) != metadata["rejected_rows"]:
+            raise ValueError("Saved shard rejection count does not match completion metadata.")
+        return PreprocessedDatasetResult(dataset=dataset, rejected_samples=rejected_samples)
     except Exception as error:
         logger.warning_rank0(f"Discarding incomplete preprocessing shard {shard_path}: {error}")
         shutil.rmtree(shard_path, ignore_errors=True)
@@ -280,12 +324,14 @@ def _load_completed_shard(shard_path: Path, expected_metadata: dict[str, Any]) -
 
 def process_dataset_in_resumable_shards(
     dataset: Dataset,
-    process_shard: Callable[[Dataset], Dataset],
+    process_shard: Callable[[Dataset], Dataset | PreprocessedDatasetResult],
     output_path: str | os.PathLike[str],
     split_name: str,
     shard_size: int,
     preprocessing_fingerprint: str,
-) -> Dataset:
+    return_result: bool = False,
+    require_row_accounting: bool = False,
+) -> Dataset | ResumableDatasetResult:
     if shard_size <= 0:
         raise ValueError("preprocessing_shard_size must be greater than zero.")
 
@@ -318,6 +364,7 @@ def process_dataset_in_resumable_shards(
         shutil.rmtree(temporary_path, ignore_errors=True)
 
     processed_shards = []
+    rejected_samples = []
     media_stat_cache: dict[str, tuple[int, int] | None] = {}
     for shard_index in range(num_shards):
         start = shard_index * shard_size
@@ -337,15 +384,40 @@ def process_dataset_in_resumable_shards(
         completed_shard = _load_completed_shard(shard_path, expected_metadata)
         if completed_shard is not None:
             logger.info_rank0(f"Reusing completed preprocessing shard {shard_index + 1}/{num_shards}.")
-            processed_shards.append(completed_shard)
+            processed_shards.append(completed_shard.dataset)
+            rejected_samples.extend(completed_shard.rejected_samples)
             continue
 
         logger.info_rank0(f"Processing preprocessing shard {shard_index + 1}/{num_shards} ({start}:{stop}).")
         temporary_path = Path(tempfile.mkdtemp(prefix=f".{shard_name}.tmp-", dir=split_path))
         try:
-            processed_shard = process_shard(input_shard)
-            processed_shard.save_to_disk(str(temporary_path), num_shards=1)
-            shard_metadata = {**expected_metadata, "output_rows": len(processed_shard)}
+            processed = process_shard(input_shard)
+            if isinstance(processed, PreprocessedDatasetResult):
+                processed_result = processed
+            else:
+                processed_result = PreprocessedDatasetResult(dataset=processed, rejected_samples=[])
+            if require_row_accounting and len(input_shard) != len(processed_result.dataset) + len(
+                processed_result.rejected_samples
+            ):
+                raise RuntimeError(
+                    f"Preprocessing shard {shard_index + 1}/{num_shards} did not account for every row: "
+                    f"input={len(input_shard)}, output={len(processed_result.dataset)}, "
+                    f"rejected={len(processed_result.rejected_samples)}."
+                )
+            processed_result.dataset.save_to_disk(str(temporary_path), num_shards=1)
+            enriched_rejections = [
+                {**record, "split": split_name, "resumable_shard_index": shard_index}
+                for record in processed_result.rejected_samples
+            ]
+            rejection_content = _serialize_jsonl(enriched_rejections)
+            _write_bytes_atomic(temporary_path / SHARD_REJECTIONS_FILE, rejection_content)
+            shard_metadata = {
+                **expected_metadata,
+                "input_rows": len(input_shard),
+                "output_rows": len(processed_result.dataset),
+                "rejected_rows": len(enriched_rejections),
+                "rejections_sha256": hashlib.sha256(rejection_content).hexdigest(),
+            }
             _write_json_atomic(temporary_path / SHARD_METADATA_FILE, shard_metadata)
             os.replace(temporary_path, shard_path)
         except Exception:
@@ -353,10 +425,19 @@ def process_dataset_in_resumable_shards(
             raise
 
         processed_shards.append(load_from_disk(str(shard_path)))
+        rejected_samples.extend(enriched_rejections)
 
     if len(processed_shards) == 1:
-        return processed_shards[0]
-    return concatenate_datasets(processed_shards)
+        processed_dataset = processed_shards[0]
+    else:
+        processed_dataset = concatenate_datasets(processed_shards)
+    rejected_samples.sort(key=lambda item: (str(item.get("source")), str(item.get("sample_id"))))
+    result = ResumableDatasetResult(
+        dataset=processed_dataset,
+        rejected_samples=rejected_samples,
+        source_rows=len(dataset),
+    )
+    return result if return_result else result.dataset
 
 
 def _link_dataset_files(dataset: Dataset, destination: Path) -> None:
