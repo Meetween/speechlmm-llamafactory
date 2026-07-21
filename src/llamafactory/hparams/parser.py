@@ -290,6 +290,11 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             raise ValueError("dynamic batching v1 supports only standard SFT")
         if training_args.max_steps <= 0:
             raise ValueError("dynamic batching requires max_steps > 0")
+        if training_args.do_eval or training_args.predict_with_generate:
+            raise ValueError(
+                "dynamic batching does not support do_eval/predict_with_generate; "
+                "run evaluation in a separate non-dynamic job"
+            )
 
     if finetuning_args.stage != "sft":
         if training_args.predict_with_generate:

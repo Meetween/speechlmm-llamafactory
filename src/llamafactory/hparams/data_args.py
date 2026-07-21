@@ -113,7 +113,7 @@ class DataArguments(SpeechLMMDataPreparationArguments, SpeechLMMDynamicBatchingA
         metadata={"help": "The number of processes to use for the pre-processing."},
     )
     preprocessing_resume: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Save preprocessing shards so interrupted tokenization can resume."},
     )
     preprocessing_shard_size: int = field(

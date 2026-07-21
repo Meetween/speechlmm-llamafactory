@@ -501,6 +501,15 @@ def get_dataset(
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
     if data_args.build_sample_shape_index:
+        from .mm_plugin import Qwen2OmniPlugin
+
+        # Fail closed: BasePlugin returns empty layouts; only Omni/SpeechLMM expose
+        # model-valid audio/visual geometry for the sample-shape index.
+        if not isinstance(template.mm_plugin, Qwen2OmniPlugin):
+            raise ValueError(
+                "build_sample_shape_index currently supports only SpeechLMM/Qwen2-Omni "
+                f"plugins; got {type(template.mm_plugin).__name__}"
+            )
         resolved_limit = getattr(processor, "speechlmm_context_limit", None)
         if resolved_limit is None or int(resolved_limit) != int(data_args.cutoff_len):
             raise ValueError(
@@ -534,8 +543,11 @@ def get_dataset(
     if data_args.build_sample_shape_index and stage != "sft":
         raise ValueError("sample-shape index building currently supports supervised fine-tuning data only")
 
-    # Load and preprocess dataset
-    with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
+    # On a shared filesystem, only the world process zero should load/tokenize/publish;
+    # other ranks wait at the barrier then consume the published artifacts.
+    # (main_process_first(local=False) == is_world_process_zero leadership.)
+    prepare_on_local_main = not data_args.data_shared_file_system
+    with training_args.main_process_first(desc="load dataset", local=prepare_on_local_main):
         dataset = _get_merged_dataset(
             data_args.dataset,
             model_args,
@@ -568,8 +580,18 @@ def get_dataset(
         if data_args.preprocessing_resume and data_args.tokenized_path is not None
         else nullcontext()
     )
-    with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
+    with training_args.main_process_first(desc="pre-process dataset", local=prepare_on_local_main):
         with output_lock:
+            if (
+                data_args.data_shared_file_system
+                and training_args.is_world_process_zero()
+                and data_args.tokenized_path is not None
+                and not has_tokenized_data(data_args.tokenized_path)
+            ):
+                logger.info_rank0(
+                    "World process zero is preparing/publishing tokenized data on the shared filesystem; "
+                    "other ranks will load after the barrier."
+                )
             if data_args.tokenized_path is not None and has_tokenized_data(data_args.tokenized_path):
                 _validate_completed_prepared_data(data_args, training_args, stage, template, tokenizer, processor)
                 tokenized_data = load_from_disk(data_args.tokenized_path)
