@@ -30,6 +30,7 @@ from speechlmm.data_loading_optimization import (
     GlobalDynamicBatchSampler,
     count_valid_shifted_target_tokens,
 )
+from speechlmm.data_loading_optimization.integration import resume_start_microstep
 from speechlmm.memory_estimation.probing import get_memory_probe, record_memory
 from transformers import Seq2SeqTrainer
 from transformers.trainer_utils import seed_worker
@@ -78,6 +79,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             training_args.accelerator_config.dispatch_batches = False
             training_args.accelerator_config.even_batches = False
             training_args.average_tokens_across_devices = True
+            # Sampler owns resume offsets; disable Trainer's generic batch skip.
+            training_args.ignore_data_skip = True
         if training_args.fp8:
             configure_fp8_environment(training_args)
             if getattr(training_args, "fp8_backend", "auto") == "te":
@@ -168,9 +171,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 data_collator, description="Training"
             )
 
+        start_microstep = 0
+        if self.args.resume_from_checkpoint:
+            start_microstep = resume_start_microstep(
+                plan=self.dynamic_batch_plan,
+                resume=self.args.resume_from_checkpoint,
+                output_dir=self.args.output_dir,
+                global_step=int(getattr(self.state, "global_step", 0) or 0),
+            )
+
         should_fork = torch.backends.mps.is_available() and self.args.dataloader_num_workers > 1
         dataloader_params = {
-            "batch_sampler": GlobalDynamicBatchSampler(self.dynamic_batch_plan),
+            "batch_sampler": GlobalDynamicBatchSampler(
+                self.dynamic_batch_plan, start_microstep=start_microstep
+            ),
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,

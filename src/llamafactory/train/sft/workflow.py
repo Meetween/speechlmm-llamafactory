@@ -18,6 +18,7 @@
 from typing import TYPE_CHECKING, Optional
 
 from speechlmm.data_loading_optimization.integration import (
+    DynamicBatchingAdmissionCallback,
     DynamicBatchingCheckpointCallback,
     build_dynamic_batch_plan,
     dynamic_plan_metrics,
@@ -123,6 +124,7 @@ def run_sft(
         )
         callbacks = list(callbacks or [])
         callbacks.append(DynamicBatchingCheckpointCallback(dynamic_batch_plan))
+        callbacks.append(DynamicBatchingAdmissionCallback(dynamic_batch_plan))
         record_memory(
             "sft.after_dynamic_batch_plan",
             extra={
