@@ -154,7 +154,7 @@ def load_model(
     r"""Load pretrained model."""
     init_kwargs = _get_init_kwargs(model_args)
     config = load_config(model_args)
-    patch_config(config, tokenizer, model_args, init_kwargs, is_trainable)
+    patch_config(config, tokenizer, model_args, init_kwargs, is_trainable, finetuning_args=finetuning_args)
     apply_liger_kernel(config, model_args, is_trainable, require_logits=(finetuning_args.stage not in ["pt", "sft"]))
 
     model = None
