@@ -111,6 +111,7 @@ def test_encode_multiturn():
     tokenizer = AutoTokenizer.from_pretrained(TINY_LLAMA3)
     template = get_template_and_fix_tokenizer(tokenizer, DataArguments(template="llama3"))
     encoded_pairs = template.encode_multiturn(tokenizer, MESSAGES)
+    assert template.encode_multiturn_batch(tokenizer, [MESSAGES], [None], [None]) == [encoded_pairs]
     prompt_str_1 = (
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHow are you<|eot_id|>"
         "<|start_header_id|>assistant<|end_header_id|>\n\n"
@@ -125,6 +126,29 @@ def test_encode_multiturn():
         (encoded_pairs[0][0], encoded_pairs[0][1], encoded_pairs[1][0], encoded_pairs[1][1]),
         (prompt_str_1, answer_str_1, prompt_str_2, answer_str_2),
     )
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_llama2_encode_multiturn_batch_matches_scalar():
+    tokenizer = AutoTokenizer.from_pretrained(TINY_LLAMA3)
+    template = get_template_and_fix_tokenizer(tokenizer, DataArguments(template="llama2"))
+    messages_batch = [MESSAGES, MESSAGES[:2]]
+    systems = [None, "System instructions."]
+    expected = [
+        template.encode_multiturn(tokenizer, messages, system)
+        for messages, system in zip(messages_batch, systems, strict=True)
+    ]
+
+    assert template.encode_multiturn_batch(tokenizer, messages_batch, systems, [None, None]) == expected
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_encode_multiturn_batch_rejects_mismatched_inputs():
+    tokenizer = AutoTokenizer.from_pretrained(TINY_LLAMA3)
+    template = get_template_and_fix_tokenizer(tokenizer, DataArguments(template="llama3"))
+
+    with pytest.raises(ValueError, match="same number of conversations"):
+        template.encode_multiturn_batch(tokenizer, [MESSAGES], [], [None])
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
@@ -161,6 +185,12 @@ def test_reasoning_encode_multiturn(cot_messages: bool, enable_thinking: bool):
     data_args = DataArguments(template="qwen3", enable_thinking=enable_thinking)
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     encoded_pairs = template.encode_multiturn(tokenizer, MESSAGES_WITH_THOUGHT if cot_messages else MESSAGES)
+    assert template.encode_multiturn_batch(
+        tokenizer,
+        [MESSAGES_WITH_THOUGHT if cot_messages else MESSAGES],
+        [None],
+        [None],
+    ) == [encoded_pairs]
 
     messages = MESSAGES if not cot_messages or enable_thinking is False else MESSAGES_WITH_THOUGHT
     prompt_str_1 = f"<|im_start|>user\n{MESSAGES[0]['content']}<|im_end|>\n<|im_start|>assistant\n"

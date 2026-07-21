@@ -32,6 +32,7 @@ from transformers.models.mllama.processing_mllama import (
     convert_sparse_cross_attention_mask_to_dense,
     get_cross_attention_token_mask,
 )
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize as qwen_smart_resize
 from typing_extensions import override
 
 from speechlmm.tokens import (
@@ -43,13 +44,10 @@ from speechlmm.tokens import (
     LIPREAD_PLACEHOLDER,
 )
 
-from ..extras.constants import (
-    AUDIO_PLACEHOLDER,
-    IGNORE_INDEX,
-    IMAGE_PLACEHOLDER,
-    VIDEO_PLACEHOLDER,
-)
+from ..extras import logging
+from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+
 
 if is_pillow_available():
     from PIL import Image
@@ -103,6 +101,38 @@ if TYPE_CHECKING:
 
         def _get_number_of_features(self, orig_height: int, orig_width: int, height: int, width: int) -> int:
             pass
+
+
+logger = logging.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class AudioTokenLayout:
+    input_samples: int
+    sampling_rate: int
+    hop_length: int
+    feature_frames: int
+    thinker_tokens: int
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class VisualTokenLayout:
+    modality: str
+    grid_t: int
+    grid_h: int
+    grid_w: int
+    merge_size: int
+    thinker_tokens: int
+    sampled_frames: int
+    seconds_per_grid: float
+
+
+@dataclass(frozen=True)
+class MultimodalTokenLayouts:
+    audios: tuple[AudioTokenLayout, ...] = ()
+    images: tuple[VisualTokenLayout, ...] = ()
+    videos: tuple[VisualTokenLayout, ...] = ()
 
 
 def _get_paligemma_token_type_ids(imglens: list[int], seqlens: list[int], processor: "MMProcessor") -> list[list[int]]:
@@ -426,6 +456,17 @@ class MMPluginMixin:
 
 @dataclass
 class BasePlugin(MMPluginMixin):
+    def process_messages_with_layout(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> tuple[list[dict[str, str]], MultimodalTokenLayouts]:
+        """Process messages and expose any model-facing geometry used."""
+        return self.process_messages(messages, images, videos, audios, processor), MultimodalTokenLayouts()
+
     def process_messages(
         self,
         messages: list[dict[str, str]],
@@ -1488,6 +1529,209 @@ class Qwen2VLPlugin(BasePlugin):
     vision_bos_token: str = "<|vision_start|>"
     vision_eos_token: str = "<|vision_end|>"
 
+    def _get_image_dimensions(self, image: "ImageInput") -> tuple[int, int]:
+        """Read dimensions without decoding the full pixel payload."""
+        if isinstance(image, ImageObject):
+            return image.width, image.height
+        if isinstance(image, bytes):
+            with Image.open(BytesIO(image)) as opened_image:
+                return opened_image.width, opened_image.height
+        if isinstance(image, dict):
+            source = BytesIO(image["bytes"]) if image["bytes"] is not None else image["path"]
+            with Image.open(source) as opened_image:
+                return opened_image.width, opened_image.height
+        if isinstance(image, str):
+            with Image.open(image) as opened_image:
+                return opened_image.width, opened_image.height
+        if hasattr(image, "read"):
+            position = image.tell() if hasattr(image, "tell") else None
+            try:
+                with Image.open(image) as opened_image:
+                    return opened_image.width, opened_image.height
+            finally:
+                if position is not None and hasattr(image, "seek"):
+                    image.seek(position)
+        raise ValueError(f"Cannot read image dimensions from {type(image)}.")
+
+    def _get_preprocessed_image_dimensions(
+        self, width: int, height: int, image_max_pixels: int, image_min_pixels: int
+    ) -> tuple[int, int]:
+        """Apply the same pre-processor geometry rules without resizing pixels."""
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid image dimensions: {width}x{height}.")
+        if width * height > image_max_pixels:
+            factor = math.sqrt(image_max_pixels / (width * height))
+            width, height = int(width * factor), int(height * factor)
+        if width * height < image_min_pixels:
+            factor = math.sqrt(image_min_pixels / (width * height))
+            width, height = int(width * factor), int(height * factor)
+        if min(width, height) < 28:
+            width, height = max(width, 28), max(height, 28)
+        if width / height > 200:
+            width = height * 180
+        if height / width > 200:
+            height = width * 180
+        return width, height
+
+    def _get_visual_grid(
+        self,
+        *,
+        width: int,
+        height: int,
+        component: "BaseImageProcessor",
+        modality: str,
+        grid_t: int,
+        sampled_frames: int,
+        seconds_per_grid: float,
+    ) -> VisualTokenLayout:
+        patch_size = int(getattr(component, "patch_size"))
+        merge_size = int(getattr(component, "merge_size"))
+        size = getattr(component, "size")
+        resized_height, resized_width = qwen_smart_resize(
+            height,
+            width,
+            factor=patch_size * merge_size,
+            min_pixels=int(size["shortest_edge"]),
+            max_pixels=int(size["longest_edge"]),
+        )
+        grid_h = resized_height // patch_size
+        grid_w = resized_width // patch_size
+        thinker_tokens = grid_t * grid_h * grid_w // (merge_size * merge_size)
+        return VisualTokenLayout(
+            modality=modality,
+            grid_t=grid_t,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            merge_size=merge_size,
+            thinker_tokens=thinker_tokens,
+            sampled_frames=sampled_frames,
+            seconds_per_grid=seconds_per_grid,
+        )
+
+    def _get_image_layout(self, image: "ImageInput", processor: "MMProcessor") -> VisualTokenLayout:
+        image_processor: BaseImageProcessor = getattr(processor, "image_processor")
+        try:
+            if not getattr(image_processor, "do_resize", True):
+                raise ValueError("The metadata fast path requires processor resizing.")
+            width, height = self._get_image_dimensions(image)
+            width, height = self._get_preprocessed_image_dimensions(
+                width,
+                height,
+                image_max_pixels=getattr(processor, "image_max_pixels", 768 * 768),
+                image_min_pixels=getattr(processor, "image_min_pixels", 32 * 32),
+            )
+            return self._get_visual_grid(
+                width=width,
+                height=height,
+                component=image_processor,
+                modality="image",
+                grid_t=1,
+                sampled_frames=1,
+                seconds_per_grid=0.0,
+            )
+        except Exception as error:
+            logger.warning_rank0_once(
+                "Image metadata was insufficient for placeholder expansion; falling back to full image decoding."
+            )
+            logger.debug(f"Image placeholder fast path failed: {error}")
+            grid = self._get_mm_inputs([image], [], [], processor)["image_grid_thw"][0]
+            merge_size = int(getattr(image_processor, "merge_size"))
+            grid_t, grid_h, grid_w = (int(value) for value in grid)
+            return VisualTokenLayout(
+                "image",
+                grid_t,
+                grid_h,
+                grid_w,
+                merge_size,
+                grid_t * grid_h * grid_w // merge_size**2,
+                1,
+                0.0,
+            )
+
+    def _get_video_layout(self, video: "VideoInput", processor: "MMProcessor") -> VisualTokenLayout:
+        image_processor: BaseImageProcessor = getattr(processor, "image_processor")
+        video_processor: BaseVideoProcessor = getattr(processor, "video_processor")
+        video_fps = float(getattr(processor, "video_fps", 2.0))
+        video_maxlen = int(getattr(processor, "video_maxlen", 128))
+        try:
+            if not getattr(video_processor, "do_resize", True):
+                raise ValueError("The metadata fast path requires processor resizing.")
+            if _check_video_is_nested_images(video):
+                sample_count = len(video)
+                if sample_count == 0:
+                    raise ValueError("A video must contain at least one frame.")
+                dimensions = [self._get_image_dimensions(frame) for frame in video]
+                if any(size != dimensions[0] for size in dimensions[1:]):
+                    raise ValueError("Variable-resolution frame lists require full processing.")
+                width, height = dimensions[0]
+                effective_fps = video_fps
+            else:
+                position = video.tell() if hasattr(video, "tell") else None
+                try:
+                    with av.open(video, "r") as container:
+                        stream = next(candidate for candidate in container.streams if candidate.type == "video")
+                        if stream.frames <= 0 or stream.duration is None or stream.time_base is None:
+                            raise ValueError("Video layout metadata is incomplete.")
+                        duration = float(stream.duration * stream.time_base)
+                        if duration <= 0:
+                            raise ValueError("Video duration must be positive.")
+                        sample_count = len(
+                            self._get_video_sample_indices(stream, video_fps=video_fps, video_maxlen=video_maxlen)
+                        )
+                        width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0))
+                        height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0))
+                        effective_fps = sample_count / duration
+                finally:
+                    if position is not None and hasattr(video, "seek"):
+                        video.seek(position)
+
+            width, height = self._get_preprocessed_image_dimensions(
+                width,
+                height,
+                image_max_pixels=getattr(processor, "video_max_pixels", 256 * 256),
+                image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
+            )
+            frame_count = sample_count + sample_count % 2
+            temporal_patch_size = int(getattr(video_processor, "temporal_patch_size", 2))
+            frame_count = math.ceil(frame_count / temporal_patch_size) * temporal_patch_size
+            return self._get_visual_grid(
+                width=width,
+                height=height,
+                component=video_processor,
+                modality="video",
+                grid_t=frame_count // temporal_patch_size,
+                sampled_frames=sample_count,
+                seconds_per_grid=float(getattr(image_processor, "temporal_patch_size", 2)) / effective_fps,
+            )
+        except Exception as error:
+            logger.warning_rank0_once(
+                "Video metadata was insufficient for placeholder expansion; falling back to full video decoding."
+            )
+            logger.debug(f"Video placeholder fast path failed: {error}")
+            mm_inputs = self._get_mm_inputs([], [video], [], processor)
+            grid = mm_inputs["video_grid_thw"][0]
+            grid_t, grid_h, grid_w = (int(value) for value in grid)
+            merge_size = int(getattr(video_processor, "merge_size"))
+            seconds = mm_inputs.get("video_second_per_grid", mm_inputs.get("second_per_grid_ts", [0.0]))
+            return VisualTokenLayout(
+                "video",
+                grid_t,
+                grid_h,
+                grid_w,
+                merge_size,
+                grid_t * grid_h * grid_w // merge_size**2,
+                grid_t * int(getattr(video_processor, "temporal_patch_size", 2)),
+                float(seconds[0]),
+            )
+
+    def _get_mm_token_layouts(
+        self, images: list["ImageInput"], videos: list["VideoInput"], processor: "MMProcessor"
+    ) -> MultimodalTokenLayouts:
+        return MultimodalTokenLayouts(
+            images=tuple(self._get_image_layout(image, processor) for image in images),
+            videos=tuple(self._get_video_layout(video, processor) for video in videos),
+        )
+
     @override
     def _preprocess_image(self, image: "ImageObject", **kwargs) -> "ImageObject":
         image = super()._preprocess_image(image, **kwargs)
@@ -1585,25 +1829,28 @@ class Qwen2VLPlugin(BasePlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
+        processed, _ = self.process_messages_with_layout(messages, images, videos, audios, processor)
+        return processed
+
+    @override
+    def process_messages_with_layout(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> tuple[list[dict[str, str]], MultimodalTokenLayouts]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens, num_video_tokens = 0, 0
         messages = deepcopy(messages)
-        image_processor: BaseImageProcessor = getattr(processor, "image_processor")
-
-        merge_length: int = getattr(image_processor, "merge_size") ** 2
-        if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
-            image_grid_thw = mm_inputs.get("image_grid_thw", [])
-            video_grid_thw = mm_inputs.get("video_grid_thw", [])
-        else:
-            image_grid_thw = [None] * len(images)
-            video_grid_thw = [None] * len(videos)
+        layouts = self._get_mm_token_layouts(images, videos, processor)
 
         for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
-                image_seqlen = image_grid_thw[num_image_tokens].prod() // merge_length if self.expand_mm_tokens else 1
+                image_seqlen = layouts.images[num_image_tokens].thinker_tokens if self.expand_mm_tokens else 1
                 content = content.replace(
                     IMAGE_PLACEHOLDER,
                     f"{self.vision_bos_token}{self.image_token * image_seqlen}{self.vision_eos_token}",
@@ -1612,7 +1859,7 @@ class Qwen2VLPlugin(BasePlugin):
                 num_image_tokens += 1
 
             while VIDEO_PLACEHOLDER in content:
-                video_seqlen = video_grid_thw[num_video_tokens].prod() // merge_length if self.expand_mm_tokens else 1
+                video_seqlen = layouts.videos[num_video_tokens].thinker_tokens if self.expand_mm_tokens else 1
                 content = content.replace(
                     VIDEO_PLACEHOLDER,
                     f"{self.vision_bos_token}{self.video_token * video_seqlen}{self.vision_eos_token}",
@@ -1622,7 +1869,7 @@ class Qwen2VLPlugin(BasePlugin):
 
             message["content"] = content
 
-        return messages
+        return messages, layouts
 
 
 @dataclass
@@ -1884,6 +2131,105 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
     audio_bos_token: str = "<|audio_start|>"
     audio_eos_token: str = "<|audio_end|>"
 
+    def _audio_feature_extractor_kwargs(self, processor: "MMProcessor") -> dict[str, object]:
+        sampling_rate = int(getattr(processor, "audio_sampling_rate", 16000))
+        kwargs: dict[str, object] = {
+            "sampling_rate": sampling_rate,
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+        }
+        max_audio_seconds = getattr(processor, "max_input_audio_seconds", None)
+        if max_audio_seconds is not None:
+            kwargs.update(
+                padding="longest",
+                truncation=True,
+                max_length=int(max_audio_seconds * sampling_rate),
+            )
+        else:
+            kwargs["padding"] = "max_length"
+        return kwargs
+
+    def _audio_thinker_tokens(self, feature_frames: int, processor: "MMProcessor") -> int:
+        if processor.__class__.__name__ == "Qwen3OmniMoeProcessor":
+            remainder = feature_frames % 100
+            feature_length = (remainder - 1) // 2 + 1
+            return ((feature_length - 1) // 2 + 1 - 1) // 2 + 1 + (feature_frames // 100) * 13
+        input_length = (feature_frames - 1) // 2 + 1
+        return (input_length - 2) // 2 + 1
+
+    def _get_audio_layouts(
+        self,
+        audios: list["AudioInput"],
+        processor: "MMProcessor",
+    ) -> tuple[AudioTokenLayout, ...]:
+        """Resolve audio feature lengths without decoding supported lossless files."""
+        feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor")
+        sampling_rate = int(getattr(processor, "audio_sampling_rate", 16000))
+        hop_length = int(getattr(feature_extractor, "hop_length", 160))
+        custom_seconds = getattr(processor, "max_input_audio_seconds", None)
+        max_samples = (
+            int(custom_seconds * sampling_rate)
+            if custom_seconds is not None
+            else getattr(feature_extractor, "n_samples", None)
+        )
+        lossless_extensions = {".aif", ".aiff", ".flac", ".wav"}
+        resolved: list[AudioTokenLayout | None] = [None] * len(audios)
+        fallback_audios: list[AudioInput] = []
+        fallback_indices: list[int] = []
+
+        for index, audio in enumerate(audios):
+            input_samples = None
+            if isinstance(audio, np.ndarray):
+                input_samples = int(audio.shape[-1])
+            elif isinstance(audio, str) and os.path.splitext(audio)[1].lower() in lossless_extensions:
+                try:
+                    with av.open(audio, "r") as container:
+                        stream = next(candidate for candidate in container.streams if candidate.type == "audio")
+                        if stream.duration is not None and stream.time_base is not None:
+                            input_samples = math.ceil(float(stream.duration * stream.time_base) * sampling_rate)
+                except Exception as error:
+                    logger.warning_rank0_once(
+                        "Audio metadata was insufficient for placeholder expansion; falling back to audio decoding."
+                    )
+                    logger.debug(f"Audio placeholder fast path failed: {error}")
+
+            if input_samples is None:
+                fallback_indices.append(index)
+                fallback_audios.append(audio)
+                continue
+
+            processed_samples = min(input_samples, max_samples) if max_samples is not None else input_samples
+            feature_frames = math.ceil(processed_samples / hop_length)
+            resolved[index] = AudioTokenLayout(
+                input_samples=input_samples,
+                sampling_rate=sampling_rate,
+                hop_length=hop_length,
+                feature_frames=feature_frames,
+                thinker_tokens=self._audio_thinker_tokens(feature_frames, processor),
+                truncated=max_samples is not None and input_samples > max_samples,
+            )
+
+        if fallback_audios:
+            regularized = self._regularize_audios(fallback_audios, sampling_rate=sampling_rate)["audios"]
+            fallback_inputs = feature_extractor(regularized, **self._audio_feature_extractor_kwargs(processor))
+            feature_lengths = fallback_inputs["attention_mask"].sum(-1).tolist()
+            for index, audio, feature_frames in zip(
+                fallback_indices, regularized, feature_lengths, strict=True
+            ):
+                input_samples = int(audio.shape[-1])
+                resolved[index] = AudioTokenLayout(
+                    input_samples=input_samples,
+                    sampling_rate=sampling_rate,
+                    hop_length=hop_length,
+                    feature_frames=int(feature_frames),
+                    thinker_tokens=self._audio_thinker_tokens(int(feature_frames), processor),
+                    truncated=max_samples is not None and input_samples > max_samples,
+                )
+
+        if any(layout is None for layout in resolved):
+            raise RuntimeError("failed to resolve every audio layout")
+        return tuple(layout for layout in resolved if layout is not None)
+
     @override
     def _get_mm_inputs(
         self,
@@ -1925,21 +2271,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 audios,
                 sampling_rate=sampling_rate,
             )["audios"]
-            max_audio_seconds = getattr(processor, "max_input_audio_seconds", None)
-            fe_kwargs = dict(
-                sampling_rate=sampling_rate,
-                return_attention_mask=True,
-                return_tensors="pt",
-            )
-            if max_audio_seconds is not None:
-                fe_kwargs.update(
-                    padding="longest",
-                    truncation=True,
-                    max_length=int(max_audio_seconds * sampling_rate),
-                )
-            else:
-                fe_kwargs["padding"] = "max_length"
-            mm_inputs.update(feature_extractor(audios, **fe_kwargs))
+            mm_inputs.update(feature_extractor(audios, **self._audio_feature_extractor_kwargs(processor)))
             mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask")  # prevent conflicts
         return mm_inputs
 
@@ -1952,37 +2284,36 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
+        processed, _ = self.process_messages_with_layout(messages, images, videos, audios, processor)
+        return processed
+
+    @override
+    def process_messages_with_layout(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> tuple[list[dict[str, str]], MultimodalTokenLayouts]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens, num_video_tokens, num_audio_tokens = 0, 0, 0
         messages = deepcopy(messages)
-        image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
-
-        merge_length = processor.image_processor.merge_size**2
         use_audio_in_video = getattr(processor, "use_audio_in_video", False)
-        if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
-            image_grid_thw = mm_inputs.get("image_grid_thw", [])
-            video_grid_thw = mm_inputs.get("video_grid_thw", [])
-            if "feature_attention_mask" in mm_inputs:
-                if processor.__class__.__name__ == "Qwen3OmniMoeProcessor":  # for qwen3omni
-                    input_lengths = mm_inputs["feature_attention_mask"].sum(-1)
-                    input_lengths_leave = input_lengths % 100
-                    feature_lengths = (input_lengths_leave - 1) // 2 + 1
-                    audio_lengths = ((feature_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-                else:
-                    input_lengths = (mm_inputs["feature_attention_mask"].sum(-1).numpy() - 1) // 2 + 1
-                    audio_lengths = (input_lengths - 2) // 2 + 1
-        else:
-            mm_inputs = {}
-            image_grid_thw = [None] * len(images)
-            video_grid_thw = [None] * len(videos)
-            audio_lengths = [None] * len(audios)
+        visual_layouts = self._get_mm_token_layouts(images, videos, processor)
+        audio_layouts = self._get_audio_layouts(audios, processor)
+        layouts = MultimodalTokenLayouts(
+            audios=audio_layouts,
+            images=visual_layouts.images,
+            videos=visual_layouts.videos,
+        )
+        audio_lengths = [layout.thinker_tokens for layout in layouts.audios]
 
         for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
-                image_seqlen = image_grid_thw[num_image_tokens].prod() // merge_length if self.expand_mm_tokens else 1
+                image_seqlen = layouts.images[num_image_tokens].thinker_tokens if self.expand_mm_tokens else 1
                 content = content.replace(
                     IMAGE_PLACEHOLDER,
                     f"{self.vision_bos_token}{self.image_token * image_seqlen}{self.vision_eos_token}",
@@ -2007,16 +2338,13 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                         )
 
                     audio_t_index = torch.arange(audio_lengths[num_audio_tokens])
+                    video_layout = layouts.videos[num_video_tokens]
                     video_t_index = (
-                        torch.arange(video_grid_thw[num_video_tokens][0])
-                        .view(-1, 1, 1)
-                        .expand(
-                            -1,
-                            video_grid_thw[num_video_tokens][1] // image_processor.merge_size,
-                            video_grid_thw[num_video_tokens][2] // image_processor.merge_size,
-                        )
+                        torch.arange(video_layout.grid_t)
+                        .view(-1, 1)
+                        .expand(-1, video_layout.thinker_tokens // video_layout.grid_t)
                         .flatten()
-                        * mm_inputs["video_second_per_grid"][num_video_tokens]
+                        * video_layout.seconds_per_grid
                         * 25  # FIXME hardcode of position_id_per_seconds=25
                     ).long()
                     t_ntoken_per_chunk = 50  # FIXME hardcode: [25 * 2]
@@ -2049,9 +2377,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                     num_audio_tokens += 1
 
                 while VIDEO_PLACEHOLDER in content:
-                    video_seqlen = (
-                        video_grid_thw[num_video_tokens].prod() // merge_length if self.expand_mm_tokens else 1
-                    )
+                    video_seqlen = layouts.videos[num_video_tokens].thinker_tokens if self.expand_mm_tokens else 1
                     content = content.replace(
                         VIDEO_PLACEHOLDER,
                         f"{self.vision_bos_token}{self.video_token * video_seqlen}{self.vision_eos_token}",
@@ -2061,7 +2387,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
 
             message["content"] = content
 
-        return messages
+        return messages, layouts
 
 
 @dataclass
@@ -2145,6 +2471,21 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         processor: Optional["MMProcessor"],
         lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
+        processed, _ = self.process_messages_with_layout(
+            messages, images, videos, audios, processor, lipread=lipread
+        )
+        return processed
+
+    @override
+    def process_messages_with_layout(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"] | None = None,
+    ) -> tuple[list[dict[str, str]], MultimodalTokenLayouts]:
         """Process messages for input vs output audio.
 
         Distinguishes user-turn input audio from assistant-turn output audio.
@@ -2168,138 +2509,26 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
                         input_audios.append(next(audio_iter))
                     except StopIteration:
                         break
+
+        messages, layouts = super().process_messages_with_layout(
+            messages, images, videos, input_audios, processor
+        )
         if lipread:
-            return self._process_messages(messages, images, videos, input_audios, processor, lipread=lipread)
-        else:
-            return super().process_messages(messages, images, videos, input_audios, processor)
-
-    def _process_messages(
-        self,
-        messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
-        lipread: list["VideoInput"] | None = None,
-    ) -> list[dict[str, str]]:
-        self._validate_input(processor, images, videos, audios, lipread=lipread)
-        self._validate_messages(messages, images, videos, audios)
-        num_image_tokens, num_video_tokens, num_audio_tokens, num_lipread_tokens = 0, 0, 0, 0
-        messages = deepcopy(messages)
-        image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
-
-        merge_length = processor.image_processor.merge_size**2
-        use_audio_in_video = getattr(processor, "use_audio_in_video", False)
-        if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor, lipread=lipread)
-            image_grid_thw = mm_inputs.get("image_grid_thw", [])
-            video_grid_thw = mm_inputs.get("video_grid_thw", [])
-            if "feature_attention_mask" in mm_inputs:
-                if processor.__class__.__name__ == "Qwen3OmniMoeProcessor":  # for qwen3omni
-                    input_lengths = mm_inputs["feature_attention_mask"].sum(-1)
-                    input_lengths_leave = input_lengths % 100
-                    feature_lengths = (input_lengths_leave - 1) // 2 + 1
-                    audio_lengths = ((feature_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-                else:
-                    input_lengths = (mm_inputs["feature_attention_mask"].sum(-1).numpy() - 1) // 2 + 1
-                    audio_lengths = (input_lengths - 2) // 2 + 1
-        else:
-            mm_inputs = {}
-            image_grid_thw = [None] * len(images)
-            video_grid_thw = [None] * len(videos)
-            audio_lengths = [None] * len(audios)
-
-        for message in messages:
-            content = message["content"]
-            while IMAGE_PLACEHOLDER in content:
-                image_seqlen = image_grid_thw[num_image_tokens].prod() // merge_length if self.expand_mm_tokens else 1
-                content = content.replace(
-                    IMAGE_PLACEHOLDER,
-                    f"{self.vision_bos_token}{self.image_token * image_seqlen}{self.vision_eos_token}",
-                    1,
-                )
-                num_image_tokens += 1
-
-            if (
-                use_audio_in_video and len(audios) and len(videos)
-            ):  # if use the audio of video # deal video token and audio token togather
-                if len(videos) != len(audios):
-                    raise ValueError(
-                        f"Number of videos ({len(videos)}) must match number of audios ({len(audios)}) when using audio in video."
-                    )
-
-                while VIDEO_PLACEHOLDER in content:
-                    video_pos = content.find(VIDEO_PLACEHOLDER)
-                    audio_pos = content.find(AUDIO_PLACEHOLDER, video_pos)
-                    if audio_pos == -1 or audio_pos < video_pos:
-                        raise ValueError(
-                            f"Each {VIDEO_PLACEHOLDER} must be followed by an {AUDIO_PLACEHOLDER} when using audio in video."
-                        )
-
-                    audio_t_index = torch.arange(audio_lengths[num_audio_tokens])
-                    video_t_index = (
-                        torch.arange(video_grid_thw[num_video_tokens][0])
-                        .view(-1, 1, 1)
-                        .expand(
-                            -1,
-                            video_grid_thw[num_video_tokens][1] // image_processor.merge_size,
-                            video_grid_thw[num_video_tokens][2] // image_processor.merge_size,
-                        )
-                        .flatten()
-                        * mm_inputs["video_second_per_grid"][num_video_tokens]
-                        * 25  # FIXME hardcode of position_id_per_seconds=25
-                    ).long()
-                    t_ntoken_per_chunk = 50  # FIXME hardcode: [25 * 2]
-                    video_chunk_indices = processor.get_chunked_index(video_t_index, t_ntoken_per_chunk)
-                    audio_chunk_indices = processor.get_chunked_index(audio_t_index, t_ntoken_per_chunk)
-                    placeholder_string = ""
-                    placeholder_string += self.vision_bos_token + self.audio_bos_token
-                    for j in range(max(len(video_chunk_indices), len(audio_chunk_indices))):
-                        video_chunk_index = video_chunk_indices[j] if j < len(video_chunk_indices) else None
-                        audio_chunk_index = audio_chunk_indices[j] if j < len(audio_chunk_indices) else None
-                        if video_chunk_index is not None:
-                            placeholder_string += self.video_token * (video_chunk_index[1] - video_chunk_index[0])
-
-                        if audio_chunk_index is not None:
-                            placeholder_string += self.audio_token * (audio_chunk_index[1] - audio_chunk_index[0])
-
-                    placeholder_string += self.audio_eos_token + self.vision_eos_token
-                    content = content.replace(VIDEO_PLACEHOLDER, placeholder_string, 1)
-                    content = content.replace(AUDIO_PLACEHOLDER, "", 1)
-                    num_audio_tokens += 1
-                    num_video_tokens += 1
-            else:
-                while AUDIO_PLACEHOLDER in content:
-                    audio_seqlen = audio_lengths[num_audio_tokens] if self.expand_mm_tokens else 1
+            self._validate_input(processor, images, videos, input_audios, lipread=lipread)
+            mm_inputs = self._get_mm_inputs(images, videos, input_audios, processor, lipread=lipread)
+            num_lipread_tokens = 0
+            for message in messages:
+                content = message["content"]
+                while LIPREAD_PLACEHOLDER in content:
+                    video_len = mm_inputs["lipread"][num_lipread_tokens].shape[0]
                     content = content.replace(
-                        AUDIO_PLACEHOLDER,
-                        f"{self.audio_bos_token}{self.audio_token * audio_seqlen}{self.audio_eos_token}",
+                        LIPREAD_PLACEHOLDER,
+                        f"{self.lipread_bos_token}{self.lipread_token * video_len}{self.lipread_eos_token}",
                         1,
                     )
-                    num_audio_tokens += 1
-
-                while VIDEO_PLACEHOLDER in content:
-                    video_seqlen = (
-                        video_grid_thw[num_video_tokens].prod() // merge_length if self.expand_mm_tokens else 1
-                    )
-                    content = content.replace(
-                        VIDEO_PLACEHOLDER,
-                        f"{self.vision_bos_token}{self.video_token * video_seqlen}{self.vision_eos_token}",
-                        1,
-                    )
-                    num_video_tokens += 1
-            if LIPREAD_PLACEHOLDER in content:
-                video_len = mm_inputs["lipread"][num_lipread_tokens].shape[0]
-                content = content.replace(
-                    LIPREAD_PLACEHOLDER,
-                    f"{self.lipread_bos_token}{self.lipread_token * video_len}{self.lipread_eos_token}",
-                    1,
-                )
-                num_lipread_tokens += 1
-
-            message["content"] = content
-
-        return messages
+                    num_lipread_tokens += 1
+                message["content"] = content
+        return messages, layouts
 
 
 @dataclass

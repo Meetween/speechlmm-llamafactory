@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import os
+import wave
+from fractions import Fraction
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -20,6 +23,7 @@ import pytest
 import torch
 from PIL import Image
 
+from llamafactory.data import mm_plugin
 from llamafactory.data.mm_plugin import get_mm_plugin
 from llamafactory.extras.packages import is_transformers_version_greater_than
 from llamafactory.hparams import get_infer_args
@@ -88,6 +92,36 @@ INPUT_IDS = [0, 1, 2, 3, 4]
 LABELS = [0, 1, 2, 3, 4]
 
 BATCH_IDS = [[1] * 1024]
+
+
+class LayoutImageProcessor:
+    merge_size = 2
+    patch_size = 14
+    temporal_patch_size = 2
+    do_resize = True
+    size = {"shortest_edge": 28 * 28, "longest_edge": 1024 * 1024}
+
+
+class LayoutVideoProcessor(LayoutImageProcessor):
+    pass
+
+
+def _layout_processor():
+    return SimpleNamespace(
+        image_processor=LayoutImageProcessor(),
+        video_processor=LayoutVideoProcessor(),
+        feature_extractor=SimpleNamespace(hop_length=160, n_samples=480000),
+        image_max_pixels=768 * 768,
+        image_min_pixels=32 * 32,
+        video_max_pixels=256 * 256,
+        video_min_pixels=16 * 16,
+        video_fps=2.0,
+        video_maxlen=128,
+        audio_sampling_rate=16000,
+        max_input_audio_seconds=None,
+        model_input_names=[],
+        use_audio_in_video=False,
+    )
 
 
 def _get_mm_inputs(processor: "ProcessorMixin") -> dict[str, "torch.Tensor"]:
@@ -177,6 +211,80 @@ def _check_plugin(
         ),
         expected_no_mm_inputs,
     )
+
+
+@pytest.mark.parametrize("width,height", [(16, 16), (32, 32), (2048, 1024), (4000, 10), (10, 4000)])
+def test_qwen2_layout_geometry_matches_pixel_preprocessing(width, height):
+    plugin = get_mm_plugin(name="qwen2_vl", image_token="<|image|>", video_token="<|video|>")
+    image = Image.new("RGB", (width, height))
+    processed = plugin._preprocess_image(image, image_max_pixels=256 * 256, image_min_pixels=32 * 32)
+    processed_width, processed_height = plugin._get_preprocessed_image_dimensions(
+        width, height, image_max_pixels=256 * 256, image_min_pixels=32 * 32
+    )
+    assert (processed_width, processed_height) == processed.size
+
+
+def test_qwen2_layouts_do_not_materialize_image_or_frame_list():
+    processor = _layout_processor()
+    plugin = get_mm_plugin(name="qwen2_vl", image_token="<|image|>", video_token="<|video|>")
+    layouts = plugin._get_mm_token_layouts(
+        [Image.new("RGB", (32, 32))],
+        [[Image.new("RGB", (32, 32))] * 5],
+        processor,
+    )
+    assert (layouts.images[0].grid_t, layouts.images[0].grid_h, layouts.images[0].grid_w) == (1, 2, 2)
+    assert layouts.images[0].thinker_tokens == 1
+    assert (layouts.videos[0].grid_t, layouts.videos[0].grid_h, layouts.videos[0].grid_w) == (3, 2, 2)
+    assert layouts.videos[0].thinker_tokens == 3
+
+
+def test_qwen2_video_file_layout_does_not_decode(monkeypatch):
+    class FakeVideoStream:
+        type = "video"
+        frames = 300
+        duration = 300
+        time_base = Fraction(1, 30)
+        width = 64
+        height = 32
+        codec_context = SimpleNamespace(width=64, height=32)
+
+    class FakeContainer:
+        streams = [FakeVideoStream()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def decode(self, stream):
+            raise AssertionError("metadata layout calculation must not decode frames")
+
+    monkeypatch.setattr(mm_plugin.av, "open", lambda *args, **kwargs: FakeContainer())
+    plugin = get_mm_plugin(name="qwen2_vl", image_token="<|image|>", video_token="<|video|>")
+    layout = plugin._get_video_layout("unused.mp4", _layout_processor())
+    assert (layout.thinker_tokens, layout.grid_t, layout.grid_h, layout.grid_w) == (20, 10, 2, 4)
+
+
+def test_qwen3_omni_lossless_audio_layout_honors_custom_cutoff(tmp_path):
+    audio_path = tmp_path / "one-second.wav"
+    with wave.open(str(audio_path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b"\0\0" * 16000)
+
+    processor_class = type("Qwen3OmniMoeProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = 0.5
+    processor.feature_extractor = SimpleNamespace(hop_length=160, n_samples=480000)
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+    layout = plugin._get_audio_layouts([str(audio_path)], processor)[0]
+    assert layout.input_samples == 16000
+    assert layout.feature_frames == 50
+    assert layout.thinker_tokens == 7
+    assert layout.truncated is True
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
