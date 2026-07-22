@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 from datasets import Dataset
-from speechlmm.data_loading_optimization.sample_shapes import SAMPLE_ID_COLUMN, SOURCE_ID_COLUMN
+from speechlmm.data_loading_optimization.sample_shapes import (
+    PREPARED_TOKENIZED_FEATURES,
+    SAMPLE_ID_COLUMN,
+    SOURCE_ID_COLUMN,
+)
 
 from llamafactory.data.loader import _get_preprocessed_dataset
 from llamafactory.data.preparation_errors import (
@@ -99,6 +103,9 @@ def test_prepared_tokenization_quarantines_only_recoverable_rows(tmp_path):
     assert result.dataset[SAMPLE_ID_COLUMN] == ["source:0", "source:2"]
     assert PROCESSING_ERROR_COLUMN not in result.dataset.column_names
     assert [record["sample_id"] for record in result.rejected_samples] == ["source:1"]
+    for column_name in ("images", "videos", "audios", "lipread"):
+        assert result.dataset[column_name] == [[], []]
+        assert result.dataset.features[column_name] == PREPARED_TOKENIZED_FEATURES[column_name]
 
 
 def test_prepared_tokenization_does_not_hide_unexpected_errors(tmp_path):

@@ -87,7 +87,12 @@ def test_resumable_preprocessing_survives_process_death(tmp_path):
         args=(str(output_path),),
     )
     process.start()
-    process.join(timeout=30)
+    # Spawn + datasets I/O can exceed 30s under a loaded suite on shared FS.
+    process.join(timeout=180)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=30)
+        pytest.fail("child process did not exit within 180s")
 
     assert process.exitcode == 17
     resume_path = get_resume_path(output_path)

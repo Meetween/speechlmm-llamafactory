@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, Features, concatenate_datasets, load_dataset, load_from_disk
 from huggingface_hub.utils import WeakFileLock
 from speechlmm.data_loading_optimization.sample_shapes import (
+    PREPARED_TOKENIZED_FEATURES,
     SAMPLE_ID_COLUMN,
     SAMPLE_SHAPE_FEATURES,
     SOURCE_ID_COLUMN,
@@ -342,22 +343,27 @@ def _get_preprocessed_dataset(
             desc="Running tokenizer on dataset",
         )
 
+    map_kwargs = dict(kwargs)
+    if data_args.build_sample_shape_index and not data_args.streaming:
+        map_kwargs["features"] = Features(PREPARED_TOKENIZED_FEATURES)
     dataset = dataset.map(
         dataset_processor.preprocess_dataset,
         batched=True,
         batch_size=(batch_size if not data_args.streaming else data_args.preprocessing_batch_size),
         remove_columns=column_names,
-        **kwargs,
+        **map_kwargs,
     )
 
     rejected_samples = []
     if data_args.build_sample_shape_index:
         errors = dataset[PROCESSING_ERROR_COLUMN]
-        rejected_samples = [deserialize_error(error) for error in errors if error is not None]
-        valid_indices = [index for index, error in enumerate(errors) if error is None]
+        # Prepared Features use Value("string"); accepted rows emit "" instead of null.
+        rejected_samples = [deserialize_error(error) for error in errors if error]
+        valid_indices = [index for index, error in enumerate(errors) if not error]
         dataset = dataset.select(valid_indices).remove_columns(PROCESSING_ERROR_COLUMN)
         for column_name, feature in SAMPLE_SHAPE_FEATURES.items():
-            dataset = dataset.cast_column(column_name, feature)
+            if column_name in dataset.column_names:
+                dataset = dataset.cast_column(column_name, feature)
 
     if training_args.should_log and print_example:
         try:

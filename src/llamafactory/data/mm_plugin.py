@@ -27,14 +27,6 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, NotRequired, Optional, Type
 import numpy as np
 import torch
 import torchaudio
-from transformers.image_utils import get_image_size, is_valid_image, to_numpy_array
-from transformers.models.mllama.processing_mllama import (
-    convert_sparse_cross_attention_mask_to_dense,
-    get_cross_attention_token_mask,
-)
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize as qwen_smart_resize
-from typing_extensions import override
-
 from speechlmm.tokens import (
     LIPREAD_BOS_TOKEN,
     LIPREAD_EOS_TOKEN,
@@ -43,6 +35,13 @@ from speechlmm.tokens import (
     LIPREAD_PAD_TOKEN,
     LIPREAD_PLACEHOLDER,
 )
+from transformers.image_utils import get_image_size, is_valid_image, to_numpy_array
+from transformers.models.mllama.processing_mllama import (
+    convert_sparse_cross_attention_mask_to_dense,
+    get_cross_attention_token_mask,
+)
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize as qwen_smart_resize
+from typing_extensions import override
 
 from ..extras import logging
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
@@ -69,6 +68,7 @@ else:
 if TYPE_CHECKING:
     from av.stream import Stream
     from numpy.typing import NDArray
+    from torchvision.transforms import v2
     from transformers import PreTrainedTokenizer, ProcessorMixin
     from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
     from transformers.image_processing_utils import BaseImageProcessor
@@ -133,10 +133,22 @@ class VisualTokenLayout:
 
 
 @dataclass(frozen=True)
+class LipreadTokenLayout:
+    frames: int
+    height: int
+    width: int
+    channels: int
+    thinker_tokens: int
+    source_duration_seconds: float | None = None
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
 class MultimodalTokenLayouts:
     audios: tuple[AudioTokenLayout, ...] = ()
     images: tuple[VisualTokenLayout, ...] = ()
     videos: tuple[VisualTokenLayout, ...] = ()
+    lipreads: tuple[LipreadTokenLayout, ...] = ()
 
 
 def _get_paligemma_token_type_ids(imglens: list[int], seqlens: list[int], processor: "MMProcessor") -> list[list[int]]:
@@ -467,8 +479,11 @@ class BasePlugin(MMPluginMixin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"] | None = None,
     ) -> tuple[list[dict[str, str]], MultimodalTokenLayouts]:
         """Process messages and expose any model-facing geometry used."""
+        if lipread:
+            raise ValueError("Lipread inputs require the speechlmm multimodal plugin.")
         return self.process_messages(messages, images, videos, audios, processor), MultimodalTokenLayouts()
 
     def process_messages(
@@ -478,8 +493,11 @@ class BasePlugin(MMPluginMixin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
         r"""Pre-process input messages before tokenization for VLMs."""
+        if lipread:
+            raise ValueError("Lipread inputs require the speechlmm multimodal plugin.")
         self._validate_input(processor, images, videos, audios)
         return messages
 
@@ -2313,8 +2331,11 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
-        processed, _ = self.process_messages_with_layout(messages, images, videos, audios, processor)
+        processed, _ = self.process_messages_with_layout(
+            messages, images, videos, audios, processor, lipread=lipread
+        )
         return processed
 
     @override
@@ -2325,7 +2346,10 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
+        lipread: list["VideoInput"] | None = None,
     ) -> tuple[list[dict[str, str]], MultimodalTokenLayouts]:
+        if lipread:
+            raise ValueError("Lipread inputs require the speechlmm multimodal plugin.")
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens, num_video_tokens, num_audio_tokens = 0, 0, 0
@@ -2543,6 +2567,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         messages, layouts = super().process_messages_with_layout(
             messages, images, videos, input_audios, processor
         )
+        lipread_layouts: list[LipreadTokenLayout] = []
         if lipread:
             self._validate_input(processor, images, videos, input_audios, lipread=lipread)
             mm_inputs = self._get_mm_inputs(images, videos, input_audios, processor, lipread=lipread)
@@ -2550,7 +2575,20 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
             for message in messages:
                 content = message["content"]
                 while LIPREAD_PLACEHOLDER in content:
-                    video_len = mm_inputs["lipread"][num_lipread_tokens].shape[0]
+                    video_len = int(mm_inputs["lipread"][num_lipread_tokens].shape[0])
+                    # bos + pads + eos are all Thinker tokens for lipread spans
+                    thinker_tokens = video_len + 2
+                    lipread_layouts.append(
+                        LipreadTokenLayout(
+                            frames=video_len,
+                            height=LIPREAD_FRAME_SIZE,
+                            width=LIPREAD_FRAME_SIZE,
+                            channels=1,
+                            thinker_tokens=thinker_tokens,
+                            source_duration_seconds=video_len / float(LIPREAD_FPS),
+                            truncated=False,
+                        )
+                    )
                     content = content.replace(
                         LIPREAD_PLACEHOLDER,
                         f"{self.lipread_bos_token}{self.lipread_token * video_len}{self.lipread_eos_token}",
@@ -2558,6 +2596,13 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
                     )
                     num_lipread_tokens += 1
                 message["content"] = content
+        if lipread_layouts:
+            layouts = MultimodalTokenLayouts(
+                audios=layouts.audios,
+                images=layouts.images,
+                videos=layouts.videos,
+                lipreads=tuple(lipread_layouts),
+            )
         return messages, layouts
 
 

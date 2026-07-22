@@ -20,6 +20,7 @@ from speechlmm.data_loading_optimization.sample_shapes import (
     AUDIO_LAYOUTS_COLUMN,
     CONTEXT_LIMIT_COLUMN,
     IMAGE_LAYOUTS_COLUMN,
+    LIPREAD_LAYOUTS_COLUMN,
     PRETRUNCATE_TARGET_TOKENS_COLUMN,
     PRETRUNCATE_TOKENS_COLUMN,
     SAMPLE_ID_COLUMN,
@@ -315,19 +316,33 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
-            model_inputs["images"].append(examples["_images"][i] if "_images" in examples else None)
-            model_inputs["videos"].append(examples["_videos"][i] if "_videos" in examples else None)
-            model_inputs["audios"].append(examples["_audios"][i] if "_audios" in examples else None)
+            images = examples["_images"][i] if "_images" in examples else None
+            videos = examples["_videos"][i] if "_videos" in examples else None
+            audios = examples["_audios"][i] if "_audios" in examples else None
             lipread_column = examples.get("_lipread")
-            model_inputs["lipread"].append(lipread_column[i] if lipread_column is not None else None)
+            lipread = lipread_column[i] if lipread_column is not None else None
+            # Prepared-data Arrow maps cannot mix null and list media types across rows.
+            if self.data_args.build_sample_shape_index:
+                images = [] if images is None else images
+                videos = [] if videos is None else videos
+                audios = [] if audios is None else audios
+                lipread = [] if lipread is None else lipread
+            model_inputs["images"].append(images)
+            model_inputs["videos"].append(videos)
+            model_inputs["audios"].append(audios)
+            model_inputs["lipread"].append(lipread)
             codec_tokens = examples.get("_codec_tokens", [None] * len(examples["_prompt"]))
-            model_inputs["codec_tokens"].append(codec_tokens[i])
+            codec_value = codec_tokens[i]
+            if self.data_args.build_sample_shape_index and codec_value is None:
+                codec_value = []
+            model_inputs["codec_tokens"].append(codec_value)
             if SOURCE_ID_COLUMN in examples:
                 model_inputs[SOURCE_ID_COLUMN].append(examples[SOURCE_ID_COLUMN][i])
             if SAMPLE_ID_COLUMN in examples:
                 model_inputs[SAMPLE_ID_COLUMN].append(examples[SAMPLE_ID_COLUMN][i])
             if self.data_args.build_sample_shape_index:
-                model_inputs[PROCESSING_ERROR_COLUMN].append(rejected)
+                # Features declare a string column; keep empty string for accepted rows.
+                model_inputs[PROCESSING_ERROR_COLUMN].append("" if rejected is None else rejected)
                 model_inputs[AUDIO_LAYOUTS_COLUMN].append(
                     [] if layouts is None else [asdict(layout) for layout in layouts.audios]
                 )
@@ -336,6 +351,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 )
                 model_inputs[VIDEO_LAYOUTS_COLUMN].append(
                     [] if layouts is None else [asdict(layout) for layout in layouts.videos]
+                )
+                model_inputs[LIPREAD_LAYOUTS_COLUMN].append(
+                    [] if layouts is None else [asdict(layout) for layout in getattr(layouts, "lipreads", ())]
                 )
                 model_inputs[CONTEXT_LIMIT_COLUMN].append(stats.context_limit)
                 model_inputs[PRETRUNCATE_TOKENS_COLUMN].append(stats.pretruncate_thinker_tokens)
