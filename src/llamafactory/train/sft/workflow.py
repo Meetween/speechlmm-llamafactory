@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 from speechlmm.data_loading_optimization.integration import (
     DynamicBatchingAdmissionCallback,
     DynamicBatchingCheckpointCallback,
+    ProbeResetPeakEachStepCallback,
     build_dynamic_batch_plan,
     dynamic_plan_metrics,
 )
@@ -97,6 +98,9 @@ def run_sft(
             },
         )
 
+    callbacks = list(callbacks or [])
+    callbacks.append(ProbeResetPeakEachStepCallback())
+
     tokenizer_module = load_tokenizer(model_args)
     if data_args.build_sample_shape_index or data_args.dynamic_batching:
         apply_model_derived_preparation_limits(
@@ -122,7 +126,6 @@ def run_sft(
             finetuning_args=finetuning_args,
             processor=tokenizer_module.get("processor"),
         )
-        callbacks = list(callbacks or [])
         callbacks.append(DynamicBatchingCheckpointCallback(dynamic_batch_plan))
         callbacks.append(DynamicBatchingAdmissionCallback(dynamic_batch_plan))
         record_memory(
