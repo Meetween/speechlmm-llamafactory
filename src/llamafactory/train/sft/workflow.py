@@ -293,10 +293,15 @@ def run_sft(
         tokenizer.padding_side = "left"  # use left-padding in generation
 
     # Evaluation
-    if training_args.do_eval:
+    if training_args.do_eval and getattr(model_args, "final_eval_after_train", True):
         metrics = trainer.evaluate(metric_key_prefix="eval", **gen_kwargs)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+    elif training_args.do_eval:
+        logger.info_rank0(
+            "Skipping the additional post-training evaluation because "
+            "final_eval_after_train=false."
+        )
 
     # Predict
     if training_args.do_predict:

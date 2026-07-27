@@ -8,6 +8,7 @@ import pytest
 
 from llamafactory.hparams import parser as parser_module
 from llamafactory.hparams.data_args import DataArguments
+from llamafactory.hparams.model_args import ModelArguments
 
 
 def test_build_sample_shape_index_requires_tokenized_path():
@@ -37,6 +38,14 @@ def test_dynamic_evaluation_limit_must_be_positive():
             dynamic_batching_index="/tmp/prepared/sample_shapes",
             dynamic_batching_max_eval_samples_per_dataset=0,
         )
+
+
+def test_final_evaluation_can_be_disabled_for_staged_handoff():
+    model_args = ModelArguments(
+        model_name_or_path="/tmp/model",
+        final_eval_after_train=False,
+    )
+    assert model_args.final_eval_after_train is False
 
 
 def test_parser_source_accepts_integer_epochs_and_rejects_non_loss_eval():
