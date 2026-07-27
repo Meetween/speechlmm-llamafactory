@@ -739,10 +739,12 @@ def get_dataset(
 
             shape_index = None
             shape_summary = None
+            evaluation_shape_indices = {}
             if data_args.build_sample_shape_index:
                 from speechlmm.data_loading_optimization import (
                     TEMPORARY_SHAPE_COLUMNS,
                     build_sample_shape_index_from_dataset,
+                    write_evaluation_sample_shape_indices,
                     write_sample_shape_index,
                 )
 
@@ -768,6 +770,19 @@ def get_dataset(
                 )
                 train_dict["train"] = tagged_train.remove_columns(list(TEMPORARY_SHAPE_COLUMNS))
                 for key, eval_split in eval_dict.items():
+                    missing = set(TEMPORARY_SHAPE_COLUMNS) - set(eval_split.column_names)
+                    if missing:
+                        raise ValueError(
+                            f"validation sample geometry was lost during tokenization for {key}: {sorted(missing)}"
+                        )
+                    eval_index, eval_summary = build_sample_shape_index_from_dataset(
+                        dataset=eval_split,
+                        processor=processor,
+                        preprocessing_fingerprint=preprocessing_fingerprint,
+                        dataset_path=data_args.tokenized_path,
+                        split=key,
+                    )
+                    evaluation_shape_indices[key] = (eval_index, eval_summary)
                     removable = [name for name in TEMPORARY_SHAPE_COLUMNS if name in eval_split.column_names]
                     if removable:
                         eval_dict[key] = eval_split.remove_columns(removable)
@@ -790,6 +805,10 @@ def get_dataset(
                         write_sample_shape_index(
                             shape_index,
                             shape_summary,
+                            assembly_path / relative_index_path,
+                        )
+                        write_evaluation_sample_shape_indices(
+                            evaluation_shape_indices,
                             assembly_path / relative_index_path,
                         )
                         write_rejected_samples(

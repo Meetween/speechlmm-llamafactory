@@ -398,6 +398,36 @@ def test_qwen3_omni_compressed_audio_layout_uses_container_metadata(monkeypatch)
     assert layout.truncated is False
 
 
+def test_qwen3_omni_audio_layout_drops_incomplete_feature_hop(monkeypatch):
+    class FakeAudioStream:
+        type = "audio"
+        duration = 546579
+        time_base = Fraction(1, 16000)
+
+    class FakeContainer:
+        streams = [FakeAudioStream()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    processor_class = type("Qwen3OmniMoeProcessor", (), {})
+    processor = processor_class()
+    processor.audio_sampling_rate = 16000
+    processor.max_input_audio_seconds = None
+    processor.feature_extractor = SimpleNamespace(hop_length=160, n_samples=480000)
+    plugin = get_mm_plugin(name="qwen2_omni", audio_token="<|audio|>")
+    monkeypatch.setattr(mm_plugin.av, "open", lambda *args, **kwargs: FakeContainer())
+
+    layout = plugin._get_audio_layouts(["chapter.mp3"], processor)[0]
+
+    assert layout.input_samples == 546579
+    assert layout.feature_frames == 3416
+    assert layout.thinker_tokens == 444
+
+
 def test_qwen3_omni_audio_metadata_oom_is_not_treated_as_a_decode_fallback(monkeypatch):
     processor_class = type("Qwen3OmniMoeProcessor", (), {})
     processor = processor_class()

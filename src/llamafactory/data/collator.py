@@ -22,9 +22,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
-from transformers import DataCollatorForSeq2Seq
-
 from speechlmm.tokens import LIPREAD_FRAME_SIZE
+from transformers import DataCollatorForSeq2Seq
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
@@ -99,6 +98,78 @@ def _audio_seqlens_from_input_ids(
     return torch.tensor(seqlens, device=input_ids.device, dtype=torch.long)
 
 
+def _reconcile_audio_placeholder_tokens(
+    features: list[dict[str, Any]],
+    batch_audlens: list[int],
+    mm_inputs: dict[str, Any],
+    config: Any,
+) -> None:
+    r"""Make prepared audio placeholders match the features decoded at runtime.
+
+    Older prepared datasets may contain one extra audio token because their
+    metadata fast path rounded an incomplete feature-extractor hop upward.
+    Reconcile the ignored placeholder span before padding so the model always
+    receives exactly one placeholder per audio-tower output.
+    """
+    feature_attention_mask = mm_inputs.get("feature_attention_mask")
+    if feature_attention_mask is None:
+        return
+
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        _get_feat_extract_output_lengths,
+    )
+
+    expected_counts = [
+        int(_get_feat_extract_output_lengths(int(length))) for length in feature_attention_mask.sum(dim=-1).tolist()
+    ]
+    if len(expected_counts) != sum(batch_audlens):
+        raise ValueError(
+            "Decoded audio count does not match the prepared batch: "
+            f"decoded={len(expected_counts)}, prepared={sum(batch_audlens)}"
+        )
+
+    audio_start_id = getattr(config, "audio_start_token_id", None)
+    audio_end_id = getattr(config, "audio_end_token_id", None)
+    audio_token_id = getattr(config, "audio_token_id", None)
+    if audio_start_id is None or audio_end_id is None or audio_token_id is None:
+        return
+
+    audio_offset = 0
+    for feature, audio_count in zip(features, batch_audlens, strict=True):
+        if audio_count == 0:
+            continue
+        input_ids = feature["input_ids"]
+        starts = [index for index, token in enumerate(input_ids) if token == audio_start_id]
+        ends = [index for index, token in enumerate(input_ids) if token == audio_end_id]
+        if len(starts) != audio_count or len(ends) != audio_count:
+            raise ValueError(
+                "Prepared audio spans do not match media references: "
+                f"starts={len(starts)}, ends={len(ends)}, audios={audio_count}"
+            )
+
+        for local_index in range(audio_count - 1, -1, -1):
+            start = starts[local_index]
+            end = ends[local_index]
+            if end <= start:
+                raise ValueError("Prepared audio span ends before it starts.")
+            positions = [index for index in range(start + 1, end) if feature["input_ids"][index] == audio_token_id]
+            expected = expected_counts[audio_offset + local_index]
+            delta = expected - len(positions)
+            if delta < 0:
+                remove = set(positions[delta:])
+                for name in ("input_ids", "attention_mask", "labels"):
+                    if name in feature:
+                        feature[name] = [value for index, value in enumerate(feature[name]) if index not in remove]
+            elif delta > 0:
+                insertion = end
+                feature["input_ids"][insertion:insertion] = [audio_token_id] * delta
+                if "attention_mask" in feature:
+                    feature["attention_mask"][insertion:insertion] = [1] * delta
+                if "labels" in feature:
+                    feature["labels"][insertion:insertion] = [IGNORE_INDEX] * delta
+        audio_offset += audio_count
+
+
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
     r"""Expand 2d attention mask to 4d attention mask.
 
@@ -168,7 +239,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios, batch_lipread = [], [], [], []
-        batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        batch_imglens, batch_vidlens, batch_audlens, batch_liplens, batch_input_ids = [], [], [], [], []
         batch_codec_tokens: list[list[int] | None] = []
         for feature in features:
             images = feature.pop("images", None) or []
@@ -183,6 +254,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_imglens.append(len(images))
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
+            batch_liplens.append(len(lipread))
             batch_input_ids.append(feature["input_ids"])
             batch_codec_tokens.append(codec_tokens)
 
@@ -242,6 +314,14 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             self.processor,
             lipread=batch_lipread,
         )
+        if self.model is not None:
+            _reconcile_audio_placeholder_tokens(
+                features,
+                batch_audlens,
+                mm_inputs,
+                self.model.config,
+            )
+            batch_input_ids = [feature["input_ids"] for feature in features]
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
             for i, feature in enumerate(features):
@@ -334,14 +414,18 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             max_length = max(lengths)
             n_lipread = len(lipread)
             lipread_padded = torch.zeros((n_lipread, max_length, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE))
-            lipread_mask = torch.zeros((n_lipread, max_length, max_length), dtype=torch.uint8)
+            lipread_mask = torch.zeros((n_lipread, max_length, 1), dtype=torch.uint8)
 
             for i in range(n_lipread):
                 lipread_padded[i, : lengths[i]] = lipread[i][:, 0, :, :]
-                lipread_mask[i, : lengths[i], : lengths[i]] = 1
+                lipread_mask[i, : lengths[i], 0] = 1
 
             features["lipread"] = lipread_padded
             features["lipread_mask"] = lipread_mask
+            features["lipread_batch_indices"] = torch.tensor(
+                [batch_index for batch_index, clip_count in enumerate(batch_liplens) for _ in range(clip_count)],
+                dtype=torch.long,
+            )
         return features
 
 

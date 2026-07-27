@@ -2244,7 +2244,11 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 continue
 
             processed_samples = min(input_samples, max_samples) if max_samples is not None else input_samples
-            feature_frames = math.ceil(processed_samples / hop_length)
+            # WhisperFeatureExtractor drops the final incomplete hop.  Using
+            # ceil here can emit one more <|audio_pad|> than the audio tower
+            # produces (for example, 546579 samples produce 3416 frames, not
+            # 3417), which later makes masked_scatter fail on the GPU.
+            feature_frames = processed_samples // hop_length
             resolved[index] = AudioTokenLayout(
                 input_samples=input_samples,
                 processed_samples=processed_samples,
@@ -2333,9 +2337,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         processor: Optional["MMProcessor"],
         lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
-        processed, _ = self.process_messages_with_layout(
-            messages, images, videos, audios, processor, lipread=lipread
-        )
+        processed, _ = self.process_messages_with_layout(messages, images, videos, audios, processor, lipread=lipread)
         return processed
 
     @override
@@ -2525,9 +2527,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         processor: Optional["MMProcessor"],
         lipread: list["VideoInput"] | None = None,
     ) -> list[dict[str, str]]:
-        processed, _ = self.process_messages_with_layout(
-            messages, images, videos, audios, processor, lipread=lipread
-        )
+        processed, _ = self.process_messages_with_layout(messages, images, videos, audios, processor, lipread=lipread)
         return processed
 
     @override
@@ -2564,9 +2564,7 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
                     except StopIteration:
                         break
 
-        messages, layouts = super().process_messages_with_layout(
-            messages, images, videos, input_audios, processor
-        )
+        messages, layouts = super().process_messages_with_layout(messages, images, videos, input_audios, processor)
         lipread_layouts: list[LipreadTokenLayout] = []
         if lipread:
             self._validate_input(processor, images, videos, input_audios, lipread=lipread)

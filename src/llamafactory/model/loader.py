@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import os
+from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import torch
+from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
+from speechlmm.tokens import LIPREAD_BOS_TOKEN, LIPREAD_EOS_TOKEN, LIPREAD_PAD_TOKEN
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -26,11 +31,10 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
+from transformers.integrations import is_deepspeed_zero3_enabled
 from trl import AutoModelForCausalLMWithValueHead
 
 from ..extras import logging
-from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
-from speechlmm.tokens import LIPREAD_BOS_TOKEN, LIPREAD_EOS_TOKEN, LIPREAD_PAD_TOKEN
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
 from .adapter import init_adapter
@@ -50,11 +54,118 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+TRAINABLE_MODULES_FILENAME = "trainable_modules.safetensors"
 
 
 class TokenizerModule(TypedDict):
     tokenizer: "PreTrainedTokenizer"
     processor: Optional["ProcessorMixin"]
+
+
+def _resolve_stage_base_delta(path: str) -> Path:
+    resolved = Path(path)
+    if resolved.is_dir():
+        resolved = resolved / TRAINABLE_MODULES_FILENAME
+    if not resolved.is_file():
+        raise ValueError(f"Stage base delta does not exist: {resolved}")
+    return resolved
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_parameter_name(name: str) -> str:
+    if name.startswith("base_model.model."):
+        name = name.removeprefix("base_model.model.")
+    return name.replace(".base_layer.", ".")
+
+
+def load_stage_base_delta(model: torch.nn.Module, path: str) -> None:
+    """Overlay a strict full-weight delta before PEFT/LoRA construction."""
+    from safetensors.torch import load_file
+
+    delta_path = _resolve_stage_base_delta(path)
+    state = dict(load_file(str(delta_path), device="cpu"))
+    if not state:
+        raise ValueError(f"Stage base delta is empty: {delta_path}")
+    if any("lora_" in key for key in state):
+        raise ValueError("stage_base_delta must contain full weights, not LoRA tensors")
+
+    named_parameters = dict(model.named_parameters())
+    canonical_targets: dict[str, list[str]] = {}
+    for name in named_parameters:
+        canonical_targets.setdefault(_canonical_parameter_name(name), []).append(name)
+
+    resolved_targets: dict[str, str] = {}
+    errors: list[str] = []
+    for key, tensor in state.items():
+        candidates = canonical_targets.get(_canonical_parameter_name(key), [])
+        if len(candidates) != 1:
+            errors.append(f"{key}: matched {candidates}")
+            continue
+        target_name = candidates[0]
+        target = named_parameters[target_name]
+        target_shape = tuple(getattr(target, "ds_shape", target.shape))
+        if target_shape != tuple(tensor.shape):
+            errors.append(f"{key}: checkpoint shape={tuple(tensor.shape)}, model shape={target_shape}")
+            continue
+        resolved_targets[key] = target_name
+    if errors:
+        raise ValueError("Stage base delta does not match the running model:\n- " + "\n- ".join(errors[:20]))
+
+    zero3 = is_deepspeed_zero3_enabled()
+    rank = (
+        torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+    )
+    for key, target_name in resolved_targets.items():
+        parameter = named_parameters[target_name]
+        if zero3:
+            import deepspeed
+
+            with deepspeed.zero.GatheredParameters([parameter], modifier_rank=0):
+                if rank == 0:
+                    parameter.data.copy_(
+                        state[key].to(
+                            device=parameter.device,
+                            dtype=parameter.dtype,
+                        )
+                    )
+        else:
+            parameter.data.copy_(state[key].to(device=parameter.device, dtype=parameter.dtype))
+
+    model._speechlmm_stage_base_delta = {
+        "path": str(delta_path.resolve()),
+        "sha256": _file_sha256(delta_path),
+        "keys": sorted(state),
+    }
+    logger.info_rank0(f"Loaded {len(state)} Stage-1 full-weight tensors from {delta_path}")
+
+
+@contextmanager
+def _disable_zero3_pointer_tie_inference(model_class: type["PreTrainedModel"]):
+    """Avoid treating ZeRO-3 placeholder pointers as real tied parameters.
+
+    During ``zero.Init`` every partitioned parameter can temporarily expose the
+    same zero-sized storage pointer. Transformers' compatibility fallback then
+    mistakes all of those parameters for one tied-weight group. Explicit ties
+    are already present in ``all_tied_weights_keys``; only the unreliable
+    pointer-discovery fallback is suppressed while loading the Thinker.
+    """
+    if not is_deepspeed_zero3_enabled():
+        yield
+        return
+
+    original = model_class._adjust_tied_keys_with_tied_pointers
+    model_class._adjust_tied_keys_with_tied_pointers = lambda self, missing_keys: None
+    try:
+        yield
+    finally:
+        model_class._adjust_tied_keys_with_tied_pointers = original
 
 
 def _get_init_kwargs(model_args: "ModelArguments") -> dict[str, Any]:
@@ -180,6 +291,11 @@ def load_model(
         elif getattr(config, "model_type", None) == "speechlmm":
             from speechlmm.models import SpeechLMMForConditionalGeneration
 
+            if finetuning_args.freeze_talker:
+                config.enable_talker = False
+            if finetuning_args.freeze_code2wav:
+                config.enable_code2wav = False
+
             if model_args.train_from_scratch:
                 model = SpeechLMMForConditionalGeneration._from_config(config)
             else:
@@ -194,17 +310,14 @@ def load_model(
             config_overrides = {}
             has_trainable_adapters = bool(finetuning_args.trainable_module_paths)
             has_trainable_lipread = (
-                not finetuning_args.freeze_lipread_encoder
-                or not finetuning_args.freeze_lipread_adapter
+                not finetuning_args.freeze_lipread_encoder or not finetuning_args.freeze_lipread_adapter
             )
-            if (
-                finetuning_args.freeze_language_model
-                and not has_trainable_adapters
-                and not has_trainable_lipread
-            ):
+            if finetuning_args.freeze_language_model and not has_trainable_adapters and not has_trainable_lipread:
                 config_overrides["thinker_loss_weight"] = 0.0
 
             config_overrides["enable_lipread"] = has_trainable_lipread
+            config_overrides["enable_talker"] = not finetuning_args.freeze_talker
+            config_overrides["enable_code2wav"] = not finetuning_args.freeze_code2wav
             config_overrides["lipread_bos_token_id"] = tokenizer.vocab[LIPREAD_BOS_TOKEN]
             config_overrides["lipread_eos_token_id"] = tokenizer.vocab[LIPREAD_EOS_TOKEN]
             config_overrides["lipread_pad_token_id"] = tokenizer.vocab[LIPREAD_PAD_TOKEN]
@@ -213,7 +326,31 @@ def load_model(
                 config_overrides["lipread_encoder_weights"] = lipread_encoder_weights
 
             speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
-            qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+            if (
+                getattr(config, "model_type", None) == "qwen3_omni_moe"
+                and finetuning_args.freeze_talker
+                and finetuning_args.freeze_code2wav
+            ):
+                from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+                    Qwen3OmniMoeThinkerForConditionalGeneration,
+                )
+
+                thinker_kwargs = dict(init_kwargs)
+                thinker_config = config.thinker_config
+                # The composite Thinker config inherits Transformers' generic
+                # default (True), while its authoritative text config and the
+                # checkpoint both use an independent lm_head.  Under ZeRO-3,
+                # leaving the outer default enabled makes storage-based tied-
+                # weight detection incorrectly associate the first sharded
+                # audio parameter with every Thinker tensor.
+                thinker_config.tie_word_embeddings = bool(
+                    getattr(thinker_config.text_config, "tie_word_embeddings", False)
+                )
+                thinker_kwargs["config"] = thinker_config
+                with _disable_zero3_pointer_tie_inference(Qwen3OmniMoeThinkerForConditionalGeneration):
+                    qwen3_model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(**thinker_kwargs)
+            else:
+                qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
             model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
             if lipread_encoder_weights is not None:
                 model.load_auto_avsr_weights(lipread_encoder_weights)
@@ -243,18 +380,24 @@ def load_model(
         if getattr(model.config, "model_type", None) == "speechlmm":
             SpeechLMMConfig.sync_lipread_token_ids_from_tokenizer(model.config, tokenizer)
 
+    if model_args.stage_base_delta is not None:
+        if not is_trainable:
+            raise ValueError("stage_base_delta is only supported when starting a training stage")
+        load_stage_base_delta(model, model_args.stage_base_delta)
+
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
-    # The frozen AutoAVSR lipread encoder loses its BatchNorm running stats on load: under
+    # The AutoAVSR lipread encoder loses its BatchNorm running stats on load: under
     # ZeRO-3 the 0-sized init makes transformers' storage-based tied-weight detection group
     # every lipread param/buffer, so the BN buffers get dropped by from_pretrained (speechlmm
     # resume) or reset by PEFT (wrapper path). Reloading the pristine .pth restores them
-    # exactly (the encoder is never trained); load_auto_avsr_weights is ZeRO-3-safe
-    # (GatheredParameters). Requires lipread_encoder_weights to be set on the resume config.
+    # exactly. load_auto_avsr_weights is ZeRO-3-safe (GatheredParameters) and maps original
+    # Linear keys onto PEFT base_layer keys when lipreading LoRA is active. Requires
+    # lipread_encoder_weights to be set on the resume config.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
     if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
         model.load_auto_avsr_weights(lipread_weights)
-        logger.info_rank0(f"Restored frozen AutoAVSR lipread encoder from {lipread_weights}")
+        logger.info_rank0(f"Restored AutoAVSR lipread encoder from {lipread_weights}")
 
     if add_valuehead:
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)

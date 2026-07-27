@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,7 +21,11 @@ from PIL import Image
 from transformers import AutoConfig, AutoModelForImageTextToText
 
 from llamafactory.data import get_template_and_fix_tokenizer
-from llamafactory.data.collator import MultiModalDataCollatorForSeq2Seq, prepare_4d_attention_mask
+from llamafactory.data.collator import (
+    MultiModalDataCollatorForSeq2Seq,
+    _reconcile_audio_placeholder_tokens,
+    prepare_4d_attention_mask,
+)
 from llamafactory.extras.constants import IGNORE_INDEX
 from llamafactory.hparams import get_infer_args
 from llamafactory.model import load_tokenizer
@@ -167,6 +172,32 @@ def test_4d_attention_mask():
     )
     assert list(attention_mask_computed.size()) == [2, 1, 6, 6]
     assert torch.all(attention_mask_computed == attention_mask_expected)
+
+
+def test_audio_placeholder_reconciliation_removes_stale_metadata_token():
+    start, pad, end = 10, 11, 12
+    feature = {
+        "input_ids": [1, start] + [pad] * 445 + [end, 2],
+        "attention_mask": [1] * 449,
+        "labels": [IGNORE_INDEX] * 448 + [2],
+    }
+    config = SimpleNamespace(
+        audio_start_token_id=start,
+        audio_token_id=pad,
+        audio_end_token_id=end,
+    )
+
+    _reconcile_audio_placeholder_tokens(
+        [feature],
+        [1],
+        {"feature_attention_mask": torch.ones((1, 3416), dtype=torch.long)},
+        config,
+    )
+
+    assert feature["input_ids"].count(pad) == 444
+    assert len(feature["input_ids"]) == len(feature["attention_mask"]) == len(feature["labels"]) == 448
+    assert feature["input_ids"][-2:] == [end, 2]
+    assert feature["labels"][-1] == 2
 
 
 if __name__ == "__main__":

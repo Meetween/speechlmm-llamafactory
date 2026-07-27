@@ -78,8 +78,9 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
         from transformers import is_torch_npu_available
 
         if not (is_flash_attn_2_available() or is_torch_npu_available()):
-            logger.warning_rank0("FlashAttention-2 is not installed.")
-            return
+            raise ValueError(
+                "flash_attn: fa2 was requested, but FlashAttention-2 is not installed or unavailable for this runtime"
+            )
 
         requested_attn_implementation = "flash_attention_2"
     else:
@@ -99,6 +100,29 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
             setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
     else:
         setattr(config, "_attn_implementation", requested_attn_implementation)
+
+    # Qwen3-Omni dispatches attention from three nested configs rather than
+    # from the outer composite config. Propagate an explicit request to every
+    # real attention-bearing component; runtime/profile validation still
+    # inspects the instantiated modules independently.
+    thinker_config = getattr(config, "thinker_config", None)
+    if thinker_config is not None:
+        for component_config in (
+            getattr(thinker_config, "text_config", None),
+            getattr(thinker_config, "audio_config", None),
+            getattr(thinker_config, "vision_config", None),
+        ):
+            if component_config is not None:
+                setattr(
+                    component_config,
+                    "_attn_implementation",
+                    requested_attn_implementation,
+                )
+                setattr(
+                    component_config,
+                    "_attn_implementation_internal",
+                    requested_attn_implementation,
+                )
 
 
 def print_attn_implementation(config: "PretrainedConfig") -> None:
