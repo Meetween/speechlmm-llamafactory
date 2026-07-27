@@ -70,8 +70,35 @@ def _training_function(config: dict[str, Any]) -> None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=finetuning_args.early_stopping_steps))
 
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
-    if trainable_paths:
-        callbacks.append(SaveTrainableModulesCallback(trainable_paths))
+    stage_base_delta = getattr(model_args, "stage_base_delta", None)
+    periodic_save_steps = getattr(model_args, "periodic_trainable_save_steps", None)
+    if periodic_save_steps is not None:
+        eval_strategy = getattr(training_args.eval_strategy, "value", training_args.eval_strategy)
+        save_strategy = getattr(training_args.save_strategy, "value", training_args.save_strategy)
+        if eval_strategy != "steps":
+            raise ValueError("periodic_trainable_save_steps requires eval_strategy=steps")
+        if int(training_args.eval_steps or 0) != int(periodic_save_steps):
+            raise ValueError(
+                "periodic_trainable_save_steps must equal eval_steps so validation precedes every partial checkpoint"
+            )
+        if save_strategy != "no":
+            raise ValueError(
+                "periodic trainable-only checkpoints require save_strategy=no to "
+                "prevent standard full-model checkpoints"
+            )
+        if not trainable_paths and not stage_base_delta:
+            raise ValueError(
+                "periodic_trainable_save_steps requires trainable_module_paths or "
+                "stage_base_delta so updated parameters can be identified"
+            )
+    if trainable_paths or stage_base_delta:
+        callbacks.append(
+            SaveTrainableModulesCallback(
+                trainable_paths or [],
+                stage_base_delta=stage_base_delta,
+                periodic_save_steps=periodic_save_steps,
+            )
+        )
 
     callbacks.append(ReporterCallback(model_args, data_args, finetuning_args, generating_args))  # add to last
 

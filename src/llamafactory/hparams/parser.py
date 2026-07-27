@@ -157,8 +157,7 @@ def _verify_model_args(
         init_weights = getattr(finetuning_args, "init_lora_weights", True)
         if init_weights not in (True, False, "gaussian", None):
             raise ValueError(
-                "lora_language_model_experts only supports standard LoRA initialization "
-                "(true / false / gaussian)."
+                "lora_language_model_experts only supports standard LoRA initialization (true / false / gaussian)."
             )
         if model_args.adapter_name_or_path is not None and len(model_args.adapter_name_or_path) > 1:
             raise ValueError(
@@ -278,22 +277,28 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
 
     # Check arguments
     if data_args.dynamic_batching:
-        explicitly_uses_epochs = (
-            isinstance(raw_args, dict) and "num_train_epochs" in raw_args
-        ) or (
+        explicitly_uses_epochs = (isinstance(raw_args, dict) and "num_train_epochs" in raw_args) or (
             isinstance(raw_args, list)
             and any(str(value).split("=", 1)[0] == "--num_train_epochs" for value in raw_args)
         )
-        if explicitly_uses_epochs:
-            raise ValueError("dynamic batching is step-based; remove num_train_epochs and set max_steps")
+        if explicitly_uses_epochs and training_args.max_steps > 0:
+            raise ValueError("dynamic batching accepts either max_steps or num_train_epochs, not both")
         if finetuning_args.stage != "sft":
             raise ValueError("dynamic batching v1 supports only standard SFT")
         if training_args.max_steps <= 0:
-            raise ValueError("dynamic batching requires max_steps > 0")
-        if training_args.do_eval or training_args.predict_with_generate:
+            epochs = float(training_args.num_train_epochs)
+            if epochs <= 0 or not epochs.is_integer():
+                raise ValueError("dynamic batching requires a positive integer num_train_epochs")
+        if training_args.predict_with_generate:
             raise ValueError(
-                "dynamic batching does not support do_eval/predict_with_generate; "
-                "run evaluation in a separate non-dynamic job"
+                "dynamic batching supports loss-only in-training evaluation, but not "
+                "predict_with_generate; run generation in a separate fixed-batch job"
+            )
+        if training_args.do_eval and not training_args.prediction_loss_only:
+            raise ValueError(
+                "dynamic batching in-training evaluation requires prediction_loss_only=true; "
+                "gathering full sequence-by-vocabulary logits is outside the memory profile "
+                "and can exhaust host memory"
             )
 
     if finetuning_args.stage != "sft":
@@ -305,6 +310,16 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
 
         if data_args.train_on_prompt or data_args.mask_history:
             raise ValueError("`train_on_prompt` or `mask_history` cannot be set as True except SFT.")
+
+    if model_args.stage_base_delta is not None and training_args.resume_from_checkpoint:
+        raise ValueError(
+            "stage_base_delta starts a new optimizer stage and cannot be combined with resume_from_checkpoint"
+        )
+    if model_args.save_trainable_modules_only:
+        if finetuning_args.finetuning_type != "full":
+            raise ValueError("save_trainable_modules_only is intended for full component tuning")
+        if not finetuning_args.trainable_module_paths:
+            raise ValueError("save_trainable_modules_only requires trainable_module_paths")
 
     if finetuning_args.stage == "sft" and training_args.do_predict and not training_args.predict_with_generate:
         raise ValueError("Please enable `predict_with_generate` to save model predictions.")

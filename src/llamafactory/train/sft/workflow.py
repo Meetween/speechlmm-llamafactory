@@ -22,14 +22,15 @@ from speechlmm.data_loading_optimization.integration import (
     DynamicBatchingCheckpointCallback,
     ProbeResetPeakEachStepCallback,
     build_dynamic_batch_plan,
+    build_dynamic_evaluation_plans,
     dynamic_plan_metrics,
+    validate_loaded_model_against_memory_profile,
 )
 from speechlmm.data_loading_optimization.limits import apply_model_derived_preparation_limits
 from speechlmm.memory_estimation.probing import configure_memory_probe, get_memory_probe, record_memory
-
-from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from speechlmm.tokens import build_speechlmm_special_tokens
 
+from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
@@ -60,16 +61,11 @@ def run_sft(
 ):
     needs_lipread_tokens = model_args.use_speechlmm_wrapper or (
         data_args.template == "speechlmm"
-        and (
-            not finetuning_args.freeze_lipread_encoder
-            or not finetuning_args.freeze_lipread_adapter
-        )
+        and (not finetuning_args.freeze_lipread_encoder or not finetuning_args.freeze_lipread_adapter)
     )
     if needs_lipread_tokens:
         original_add_special_tokens = getattr(model_args, "add_special_tokens", None) or []
-        model_args.add_special_tokens = original_add_special_tokens + build_speechlmm_special_tokens(
-            model_args
-        )
+        model_args.add_special_tokens = original_add_special_tokens + build_speechlmm_special_tokens(model_args)
 
     if getattr(model_args, "memory_probe", False):
         probe_dir = model_args.memory_probe_output_dir or f"{training_args.output_dir}/memory_probe"
@@ -117,6 +113,7 @@ def run_sft(
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     record_memory("sft.after_get_dataset")
     dynamic_batch_plan = None
+    dynamic_evaluation_plans = {}
     if data_args.dynamic_batching:
         dynamic_batch_plan = build_dynamic_batch_plan(
             train_dataset=dataset_module["train_dataset"],
@@ -126,7 +123,6 @@ def run_sft(
             finetuning_args=finetuning_args,
             processor=tokenizer_module.get("processor"),
         )
-        callbacks.append(DynamicBatchingCheckpointCallback(dynamic_batch_plan))
         callbacks.append(DynamicBatchingAdmissionCallback(dynamic_batch_plan))
         record_memory(
             "sft.after_dynamic_batch_plan",
@@ -135,7 +131,37 @@ def run_sft(
                 "distributed_microsteps": len(dynamic_batch_plan.microsteps),
             },
         )
+        if training_args.do_eval:
+            dynamic_evaluation_plans = build_dynamic_evaluation_plans(
+                eval_dataset=dataset_module.get("eval_dataset"),
+                training_plan=dynamic_batch_plan,
+                data_args=data_args,
+                training_args=training_args,
+                processor=tokenizer_module.get("processor"),
+            )
+            record_memory(
+                "sft.after_dynamic_evaluation_plans",
+                extra={
+                    "datasets": len(dynamic_evaluation_plans),
+                    "selected_samples": sum(plan.selected_count for plan in dynamic_evaluation_plans.values()),
+                },
+            )
+        callbacks.append(
+            DynamicBatchingCheckpointCallback(
+                dynamic_batch_plan,
+                evaluation_plans=dynamic_evaluation_plans,
+            )
+        )
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+    if data_args.dynamic_batching:
+        validate_loaded_model_against_memory_profile(
+            model=model,
+            profile_path=data_args.dynamic_batching_memory_profile,
+            model_args=model_args,
+            data_args=data_args,
+            training_args=training_args,
+            finetuning_args=finetuning_args,
+        )
     record_memory("sft.after_load_model")
     recorder = get_memory_probe()
     if recorder is not None:
@@ -216,6 +242,7 @@ def run_sft(
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
             dynamic_batch_plan=dynamic_batch_plan,
+            dynamic_evaluation_plans=dynamic_evaluation_plans,
             **dataset_module,
             **tokenizer_module,
             **metric_module,
@@ -230,7 +257,11 @@ def run_sft(
             recorder.dump_snapshot("before_trainer_train")
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         record_memory("sft.after_trainer_train")
-        if not getattr(model_args, "memory_probe_skip_model_save", False):
+        skip_model_save = bool(
+            getattr(model_args, "memory_probe_skip_model_save", False)
+            or getattr(model_args, "save_trainable_modules_only", False)
+        )
+        if not skip_model_save:
             trainer.save_model()
             record_memory("sft.after_save_model")
         else:

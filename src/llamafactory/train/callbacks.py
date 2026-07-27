@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -176,40 +178,305 @@ class SaveTrainableModulesCallback(TrainerCallback):
     """Saves trainable_module_paths weights to a separate safetensors file.
 
     Written in each checkpoint so export_checkpoint.py can reconstruct the full model.
+    Optionally, evaluation can publish an atomic, updated-parameters-only checkpoint
+    without invoking Trainer's full-model checkpoint path.
     """
 
-    def __init__(self, trainable_module_paths: list[str]) -> None:
+    def __init__(
+        self,
+        trainable_module_paths: list[str],
+        stage_base_delta: str | None = None,
+        periodic_save_steps: int | None = None,
+    ) -> None:
         self.trainable_module_paths = trainable_module_paths
+        if periodic_save_steps is not None and int(periodic_save_steps) <= 0:
+            raise ValueError("periodic_save_steps must be positive when set")
+        self.periodic_save_steps = int(periodic_save_steps) if periodic_save_steps is not None else None
+        self._last_periodic_step = -1
+        self.stage_base_delta = None
+        self.stage_base_delta_sha256 = None
+        self.inherited_keys: set[str] = set()
+        if stage_base_delta is not None:
+            from pathlib import Path
+
+            delta_path = Path(stage_base_delta)
+            if delta_path.is_dir():
+                delta_path = delta_path / TRAINABLE_MODULES_FILENAME
+            if not delta_path.is_file():
+                raise ValueError(f"Stage base delta does not exist: {delta_path}")
+            with safe_open(str(delta_path), framework="pt", device="cpu") as handle:
+                self.inherited_keys = set(handle.keys())
+            digest = hashlib.sha256()
+            with delta_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            self.stage_base_delta = str(delta_path.resolve())
+            self.stage_base_delta_sha256 = digest.hexdigest()
+
+    @staticmethod
+    def _canonical_name(name: str) -> str:
+        if name.startswith("module."):
+            name = name.removeprefix("module.")
+        clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+        return clean.replace(".base_layer.", ".")
 
     def _matches(self, name: str) -> bool:
-        clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
-        return any(clean == p or clean.startswith(p + ".") for p in self.trainable_module_paths)
+        clean = self._canonical_name(name)
+        return clean in self.inherited_keys or any(
+            clean == path or clean.startswith(path + ".") for path in self.trainable_module_paths
+        )
+
+    @staticmethod
+    def _zero3_parameter_to_rank0_cpu(parameter) -> Optional[torch.Tensor]:
+        """Reconstruct one ZeRO-3 parameter on rank 0 over the CPU control plane."""
+        from speechlmm.data_loading_optimization.integration import (
+            _control_process_group,
+        )
+
+        shard = getattr(parameter, "ds_tensor", None)
+        ds_numel = getattr(parameter, "ds_numel", None)
+        ds_shape = getattr(parameter, "ds_shape", None)
+        if shard is None or ds_numel is None or ds_shape is None:
+            raise RuntimeError(
+                "Cannot publish a partial ZeRO-3 checkpoint because a parameter "
+                "does not expose ds_tensor, ds_numel and ds_shape"
+            )
+
+        # Gather raw bytes so this works for bf16 as well as fp32 regardless of
+        # the scalar dtypes supported by the installed Gloo build.
+        local = shard.detach().contiguous().cpu().view(torch.uint8)
+        group = _control_process_group()
+        rank = torch.distributed.get_rank(group)
+        world_size = torch.distributed.get_world_size(group)
+        gathered = [torch.empty_like(local) for _ in range(world_size)] if rank == 0 else None
+        torch.distributed.gather(local, gather_list=gathered, dst=0, group=group)
+        if rank != 0:
+            return None
+
+        assert gathered is not None
+        required_bytes = int(ds_numel) * shard.element_size()
+        available_bytes = sum(tensor.numel() for tensor in gathered)
+        if available_bytes < required_bytes:
+            raise RuntimeError(
+                "ZeRO-3 shards do not contain enough data to reconstruct a "
+                f"parameter: required_bytes={required_bytes}, "
+                f"available_bytes={available_bytes}"
+            )
+        flat_bytes = torch.cat(gathered)[:required_bytes].contiguous()
+        return flat_bytes.view(shard.dtype).reshape(tuple(ds_shape)).clone()
 
     def _save_trainable_modules(self, model, output_dir: str) -> None:
         from transformers.integrations import is_deepspeed_zero3_enabled
 
+        matched = sorted(
+            [(name, parameter) for name, parameter in model.named_parameters() if self._matches(name)],
+            key=lambda item: item[0],
+        )
+        inherited_found = {
+            self._canonical_name(name) for name, _ in matched if self._canonical_name(name) in self.inherited_keys
+        }
+        missing_inherited = self.inherited_keys - inherited_found
+        if missing_inherited:
+            raise ValueError(f"Stage-2 model is missing inherited Stage-1 tensors: {sorted(missing_inherited)[:20]}")
+
+        is_main = self._is_main_process()
         state = {}
+        if self.stage_base_delta is not None and is_main:
+            with safe_open(self.stage_base_delta, framework="pt", device="cpu") as handle:
+                state.update({key: handle.get_tensor(key) for key in handle.keys()})
+
+        # Frozen inherited weights are already represented exactly by the
+        # Stage-1 file. Only capture parameters that can have changed in this
+        # stage, plus any new explicitly selected full-weight paths.
+        capture = [
+            (name, parameter)
+            for name, parameter in matched
+            if parameter.requires_grad or self._canonical_name(name) not in self.inherited_keys
+        ]
         if is_deepspeed_zero3_enabled():
-            import deepspeed
-
-            matched = [(n, p) for n, p in model.named_parameters() if self._matches(n)]
-            with deepspeed.zero.GatheredParameters([p for _, p in matched], modifier_rank=0):
-                for name, param in matched:
-                    clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
-                    state[clean] = param.data.clone().cpu()
+            for index, (name, parameter) in enumerate(capture, start=1):
+                clean = self._canonical_name(name)
+                tensor = self._zero3_parameter_to_rank0_cpu(parameter)
+                if is_main:
+                    assert tensor is not None
+                    state[clean] = tensor
+                if index == 1 or index == len(capture):
+                    logger.info_rank0(
+                        f"Captured {index}/{len(capture)} trainable-module tensors for partial checkpoint"
+                    )
         else:
-            for name, param in model.named_parameters():
-                if self._matches(name):
-                    clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
-                    state[clean] = param.data.clone().cpu()
+            for name, parameter in capture:
+                clean = self._canonical_name(name)
+                state[clean] = parameter.detach().clone().cpu()
 
-        is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         if state and is_main:
             os.makedirs(output_dir, exist_ok=True)
             save_file(state, os.path.join(output_dir, TRAINABLE_MODULES_FILENAME), metadata={"format": "pt"})
+            if self.stage_base_delta is not None:
+                with open(
+                    os.path.join(output_dir, "staged_training.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(
+                        {
+                            "schema_version": 1,
+                            "stage_base_delta": self.stage_base_delta,
+                            "stage_base_delta_sha256": self.stage_base_delta_sha256,
+                            "inherited_tensor_count": len(self.inherited_keys),
+                        },
+                        handle,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    handle.write("\n")
             logger.info_rank0(
                 f"Saved {len(state)} trainable_module_paths weights to {output_dir}/{TRAINABLE_MODULES_FILENAME}"
             )
+
+    @staticmethod
+    def _distributed_barrier() -> None:
+        if torch.distributed.is_initialized():
+            # Checkpoint publication is control-plane synchronization. Keep it
+            # off the NCCL data plane so it cannot interleave with ZeRO or
+            # dynamic-evaluation collectives that are still draining.
+            try:
+                from speechlmm.data_loading_optimization.integration import (
+                    _control_process_group,
+                )
+
+                group = _control_process_group()
+            except (ImportError, RuntimeError):
+                group = None
+            torch.distributed.barrier(group=group)
+
+    @staticmethod
+    def _checkpoint_phase(message: str) -> None:
+        if not (is_env_enabled("SPEECHLMM_CHECKPOINT_PHASE_LOG") or is_env_enabled("SPEECHLMM_PROBE_PHASE_LOG")):
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(f"[partial-checkpoint rank={rank}] {message}", flush=True)
+
+    @staticmethod
+    def _is_main_process() -> bool:
+        return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+    def _save_peft_adapter(self, model, output_dir: str) -> None:
+        if not isinstance(model, PeftModel):
+            return
+
+        matched = sorted(
+            [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad],
+            key=lambda item: item[0],
+        )
+        if not matched:
+            raise ValueError("Periodic PEFT checkpoint requested but no trainable adapter parameters were found")
+
+        state = {}
+        from transformers.integrations import is_deepspeed_zero3_enabled
+
+        if is_deepspeed_zero3_enabled():
+            # Avoid DeepSpeed's NCCL GatheredParameters path here. It can race
+            # with persistent-parameter repartitioning after evaluation, so
+            # reconstruct each tensor from its stable ZeRO shards over Gloo.
+            for index, (name, parameter) in enumerate(matched, start=1):
+                tensor = self._zero3_parameter_to_rank0_cpu(parameter)
+                if self._is_main_process():
+                    assert tensor is not None
+                    state[name] = tensor
+                if index == 1 or index % 128 == 0 or index == len(matched):
+                    logger.info_rank0(f"Reconstructed {index}/{len(matched)} PEFT tensors for periodic checkpoint")
+        elif self._is_main_process():
+            state = {name: parameter.detach().clone().cpu() for name, parameter in matched}
+
+        if self._is_main_process():
+            model.save_pretrained(
+                output_dir,
+                state_dict=state,
+                safe_serialization=True,
+            )
+            logger.info_rank0(f"Saved periodic PEFT adapter to {output_dir}/adapter_model.safetensors")
+
+    def _save_periodic_checkpoint(self, args, state, model, metrics) -> None:
+        step = int(state.global_step)
+        checkpoint = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{step}")
+        temporary = f"{checkpoint}.partial"
+
+        self._checkpoint_phase(f"step={step} enter")
+        if self._is_main_process():
+            if os.path.exists(checkpoint):
+                raise FileExistsError(f"Refusing to replace existing periodic checkpoint: {checkpoint}")
+            shutil.rmtree(temporary, ignore_errors=True)
+            os.makedirs(temporary, exist_ok=False)
+        self._checkpoint_phase(f"step={step} before entry barrier")
+        self._distributed_barrier()
+        self._checkpoint_phase(f"step={step} after entry barrier")
+
+        try:
+            self._checkpoint_phase(f"step={step} before trainable-module capture")
+            self._save_trainable_modules(model, temporary)
+            self._checkpoint_phase(f"step={step} after trainable-module capture")
+            self._distributed_barrier()
+            self._checkpoint_phase(f"step={step} before PEFT capture")
+            self._save_peft_adapter(model, temporary)
+            self._checkpoint_phase(f"step={step} after PEFT capture")
+            if self._is_main_process():
+                metadata = {
+                    "schema_version": 1,
+                    "checkpoint_kind": "updated_parameters_only",
+                    "global_step": step,
+                    "epoch": float(state.epoch) if state.epoch is not None else None,
+                    "run_name": getattr(args, "run_name", None),
+                    "optimizer_state_saved": False,
+                    "scheduler_state_saved": False,
+                    "rng_state_saved": False,
+                    "validation_metrics": metrics or {},
+                }
+                with open(
+                    os.path.join(temporary, "periodic_checkpoint.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(metadata, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                state.save_to_json(os.path.join(temporary, "trainer_state.json"))
+            self._distributed_barrier()
+            if self._is_main_process():
+                os.replace(temporary, checkpoint)
+                logger.info_rank0(f"Published updated-parameters-only checkpoint at {checkpoint}")
+            self._distributed_barrier()
+        except BaseException:
+            self._distributed_barrier()
+            if self._is_main_process():
+                shutil.rmtree(temporary, ignore_errors=True)
+            self._distributed_barrier()
+            raise
+
+    @override
+    def on_evaluate(
+        self,
+        args: "TrainingArguments",
+        state: "TrainerState",
+        control: "TrainerControl",
+        metrics=None,
+        **kwargs,
+    ):
+        step = int(state.global_step)
+        if (
+            self.periodic_save_steps is None
+            or step <= 0
+            or step % self.periodic_save_steps != 0
+            or step == self._last_periodic_step
+        ):
+            return control
+        self._save_periodic_checkpoint(
+            args=args,
+            state=state,
+            model=kwargs["model"],
+            metrics=metrics,
+        )
+        self._last_periodic_step = step
+        return control
 
     @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):

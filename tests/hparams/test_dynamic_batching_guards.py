@@ -27,8 +27,22 @@ def test_build_sample_shape_index_rejects_dynamic_batching_same_command():
         )
 
 
-def test_parser_source_rejects_eval_and_epochs_with_dynamic_batching():
+def test_dynamic_evaluation_limit_must_be_positive():
+    with pytest.raises(ValueError, match="max_eval_samples_per_dataset"):
+        DataArguments(
+            dataset="demo",
+            tokenized_path="/tmp/prepared",
+            dynamic_batching=True,
+            dynamic_batching_memory_profile="/tmp/profile.json",
+            dynamic_batching_index="/tmp/prepared/sample_shapes",
+            dynamic_batching_max_eval_samples_per_dataset=0,
+        )
+
+
+def test_parser_source_accepts_integer_epochs_and_rejects_non_loss_eval():
     source = Path(parser_module.__file__).read_text(encoding="utf-8")
-    assert "dynamic batching is step-based; remove num_train_epochs" in source
-    assert "do_eval/predict_with_generate" in source
+    assert "requires a positive integer num_train_epochs" in source
+    assert "accepts either max_steps or num_train_epochs, not both" in source
+    assert "requires prediction_loss_only=true" in source
+    assert "per_device_eval_batch_size=1" not in source
     assert 'finetuning_args.stage != "sft"' in source

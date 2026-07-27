@@ -27,6 +27,9 @@ import numpy as np
 import torch
 from speechlmm.data_loading_optimization import (
     DynamicBatchPlan,
+    DynamicEvaluationDataset,
+    DynamicEvaluationPlan,
+    DynamicTrainingDataset,
     GlobalDynamicBatchSampler,
     count_valid_shifted_target_tokens,
 )
@@ -68,12 +71,37 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         model_args: Optional["ModelArguments"] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
         dynamic_batch_plan: Optional[DynamicBatchPlan] = None,
+        dynamic_evaluation_plans: Optional[dict[str, DynamicEvaluationPlan]] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
         # Configure FP8 environment if enabled
         training_args: TrainingArguments = kwargs.get("args")
         self.dynamic_batch_plan = dynamic_batch_plan
+        self.dynamic_evaluation_plans = dict(dynamic_evaluation_plans or {})
+        if dynamic_batch_plan is not None and kwargs.get("train_dataset") is not None:
+            kwargs["train_dataset"] = DynamicTrainingDataset(kwargs["train_dataset"])
+        eval_dataset = kwargs.get("eval_dataset")
+        if self.dynamic_evaluation_plans:
+            if set(self.dynamic_evaluation_plans) == {"global"}:
+                kwargs["eval_dataset"] = DynamicEvaluationDataset(
+                    eval_dataset,
+                    self.dynamic_evaluation_plans["global"],
+                )
+            elif isinstance(eval_dataset, dict):
+                missing = set(eval_dataset) - set(self.dynamic_evaluation_plans)
+                if missing:
+                    raise ValueError(f"dynamic evaluation plans are missing datasets: {sorted(missing)}")
+                kwargs["eval_dataset"] = {
+                    name: DynamicEvaluationDataset(dataset, self.dynamic_evaluation_plans[name])
+                    for name, dataset in eval_dataset.items()
+                }
+            elif eval_dataset is not None:
+                if set(self.dynamic_evaluation_plans) != {"validation"}:
+                    raise ValueError("single validation dataset requires a plan named 'validation'")
+                kwargs["eval_dataset"] = DynamicEvaluationDataset(
+                    eval_dataset, self.dynamic_evaluation_plans["validation"]
+                )
         if dynamic_batch_plan is not None:
             training_args.accelerator_config.split_batches = False
             training_args.accelerator_config.dispatch_batches = False
@@ -88,6 +116,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         super().__init__(**kwargs)
         self._last_dynamic_metrics_step = 0
+        self._dynamic_eval_loss_numerator = 0.0
+        self._dynamic_eval_valid_tokens = 0
+        self._dynamic_eval_dataset_numerators: dict[str, float] = {}
+        self._dynamic_eval_dataset_tokens: dict[str, int] = {}
+        self._dynamic_eval_microstep = 0
+        self._active_dynamic_evaluation_plan: Optional[DynamicEvaluationPlan] = None
         if processor is not None and dynamic_batch_plan is None:
             # avoid wrong loss under gradient accumulation
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
@@ -163,13 +197,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if isinstance(dataset, datasets.Dataset):
                 dataset = self._remove_unused_columns(dataset, description="Training")
             else:
-                data_collator = self._get_collator_with_removed_columns(
-                    data_collator, description="Training"
-                )
+                data_collator = self._get_collator_with_removed_columns(data_collator, description="Training")
         except ImportError:
-            data_collator = self._get_collator_with_removed_columns(
-                data_collator, description="Training"
-            )
+            data_collator = self._get_collator_with_removed_columns(data_collator, description="Training")
 
         start_microstep = 0
         if self.args.resume_from_checkpoint:
@@ -182,9 +212,40 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         should_fork = torch.backends.mps.is_available() and self.args.dataloader_num_workers > 1
         dataloader_params = {
-            "batch_sampler": GlobalDynamicBatchSampler(
-                self.dynamic_batch_plan, start_microstep=start_microstep
+            "batch_sampler": GlobalDynamicBatchSampler(self.dynamic_batch_plan, start_microstep=start_microstep),
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "multiprocessing_context": "fork" if should_fork else None,
+            "prefetch_factor": self.args.dataloader_prefetch_factor,
+            "worker_init_fn": partial(
+                seed_worker,
+                num_workers=self.args.dataloader_num_workers,
+                rank=self.args.process_index,
             ),
+        }
+        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_params)
+        return self.accelerator.prepare(dataloader)
+
+    @override
+    def get_eval_dataloader(
+        self, eval_dataset: Optional["torch.utils.data.Dataset"] = None
+    ) -> "torch.utils.data.DataLoader":
+        if self.dynamic_batch_plan is None:
+            return super().get_eval_dataloader(eval_dataset)
+        if isinstance(eval_dataset, str):
+            if not isinstance(self.eval_dataset, dict) or eval_dataset not in self.eval_dataset:
+                raise ValueError(f"unknown dynamic evaluation dataset: {eval_dataset!r}")
+            dataset = self.eval_dataset[eval_dataset]
+        else:
+            dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if not isinstance(dataset, DynamicEvaluationDataset):
+            raise ValueError("dynamic batching evaluation requires a frozen DynamicEvaluationDataset")
+        data_collator = self._get_collator_with_removed_columns(self.data_collator, description="Evaluation")
+        should_fork = torch.backends.mps.is_available() and self.args.dataloader_num_workers > 1
+        dataloader_params = {
+            "batch_sampler": GlobalDynamicBatchSampler(dataset.dynamic_evaluation_plan),
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
@@ -205,7 +266,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.dynamic_batch_plan is None:
             return super()._get_num_items_in_batch(batch_samples, device)
         if not batch_samples or "labels" not in batch_samples[0]:
-            raise ValueError("dynamic batching requires labels in every training microbatch")
+            raise ValueError("dynamic batching requires labels in every microbatch")
         num_items = count_valid_shifted_target_tokens(batch_samples, ignore_index=IGNORE_INDEX)
         if self.args.world_size > 1:
             num_items = self.accelerator.gather(num_items.to(device)).sum()
@@ -221,47 +282,58 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return {}
         batches = [batch for step in steps for batch in step.local_batches]
         local = [step.local_batches[self.args.process_index] for step in steps]
-        padded = sum(
-            batch.estimate.batch_size * batch.estimate.padded_thinker_tokens for batch in batches
-        )
+        padded = sum(batch.estimate.batch_size * batch.estimate.padded_thinker_tokens for batch in batches)
         useful = sum(batch.unpadded_thinker_tokens for batch in batches)
         straggler_ratio = max(
             max(batch.estimate.thinker_activation_bytes for batch in step.local_batches)
             / min(batch.estimate.thinker_activation_bytes for batch in step.local_batches)
             for step in steps
         )
-        utilization = max(
-            batch.estimate.allocated_peak_bytes / batch.budget_bytes for batch in batches
-        )
+        utilization = max(batch.estimate.allocated_peak_bytes / batch.budget_bytes for batch in batches)
         allocator_slack = 0
+        measured_allocated = 0
+        measured_reserved = 0
         if torch.cuda.is_available():
-            allocator_slack = max(
-                0, torch.cuda.max_memory_reserved() - torch.cuda.max_memory_allocated()
+            local_allocated = int(torch.cuda.max_memory_allocated())
+            local_reserved = int(torch.cuda.max_memory_reserved())
+            peak_values = torch.tensor(
+                [
+                    local_allocated,
+                    local_reserved,
+                    max(0, local_reserved - local_allocated),
+                ],
+                dtype=torch.int64,
+                device=self.accelerator.device,
             )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(peak_values, op=torch.distributed.ReduceOp.MAX)
+            measured_allocated, measured_reserved, allocator_slack = (int(value) for value in peak_values.tolist())
+        predicted_peak = max(batch.estimate.allocated_peak_bytes for batch in batches)
         metrics = {
-            "dynamic_local_samples": float(sum(len(batch.dataset_indices) for batch in local)),
-            "dynamic_global_samples": float(sum(len(batch.dataset_indices) for batch in batches)),
-            "dynamic_local_valid_target_tokens": float(
-                sum(batch.estimate.valid_target_tokens for batch in local)
+            "dynamic_local_samples": float(sum(index >= 0 for batch in local for index in batch.dataset_indices)),
+            "dynamic_global_samples": float(sum(index >= 0 for batch in batches for index in batch.dataset_indices)),
+            "dynamic_synchronization_samples": float(
+                sum(index < 0 for batch in batches for index in batch.dataset_indices)
             ),
-            "dynamic_valid_target_tokens": float(
-                sum(batch.estimate.valid_target_tokens for batch in batches)
-            ),
+            "dynamic_local_valid_target_tokens": float(sum(batch.estimate.valid_target_tokens for batch in local)),
+            "dynamic_valid_target_tokens": float(sum(batch.estimate.valid_target_tokens for batch in batches)),
             "dynamic_thinker_tokens": float(useful),
             "dynamic_batch_size_min": float(min(len(batch.dataset_indices) for batch in batches)),
             "dynamic_batch_size_max": float(max(len(batch.dataset_indices) for batch in batches)),
             "dynamic_audio_feature_frames": float(sum(batch.audio_feature_frames for batch in batches)),
             "dynamic_audio_chunks": float(sum(step.global_audio_chunks for step in steps)),
-            "dynamic_visual_grids": float(
-                sum(batch.estimate.visual_grid_count for batch in batches)
-            ),
+            "dynamic_visual_grids": float(sum(batch.estimate.visual_grid_count for batch in batches)),
             "dynamic_visual_patch_tokens": float(sum(batch.visual_patch_tokens for batch in batches)),
-            "dynamic_predicted_peak_bytes": float(
-                max(batch.estimate.allocated_peak_bytes for batch in batches)
-            ),
+            "dynamic_lipread_frames": float(sum(batch.lipread_frames for batch in batches)),
+            "dynamic_predicted_peak_bytes": float(predicted_peak),
+            "gpu_peak_allocated_bytes": float(measured_allocated),
+            "gpu_peak_reserved_bytes": float(measured_reserved),
+            "dynamic_allocated_prediction_error_bytes": float(measured_allocated - predicted_peak),
+            "dynamic_allocated_prediction_ratio": (measured_allocated / predicted_peak if predicted_peak else 0.0),
+            "dynamic_reserved_prediction_error_bytes": float(measured_reserved - predicted_peak),
+            "dynamic_reserved_prediction_ratio": (measured_reserved / predicted_peak if predicted_peak else 0.0),
             "dynamic_target_utilization": utilization,
-            "dynamic_target_unused_fraction": 1.0
-            - self.dynamic_batch_plan.settings.target_memory_used,
+            "dynamic_target_unused_fraction": 1.0 - self.dynamic_batch_plan.settings.target_memory_used,
             "dynamic_allocator_reserved_unused_bytes": float(allocator_slack),
             "dynamic_padding_efficiency": useful / padded,
             "dynamic_predicted_rank_straggler_ratio": straggler_ratio,
@@ -270,16 +342,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         requested = self.dynamic_batch_plan.settings.source_probabilities or {}
         for source in sorted(set(source_counts) | set(requested)):
             safe_source = re.sub(r"[^A-Za-z0-9_]+", "_", source).strip("_") or "source"
-            metrics[f"dynamic_source_{safe_source}_realized_fraction"] = (
-                source_counts[source] / len(batches)
-            )
+            metrics[f"dynamic_source_{safe_source}_realized_fraction"] = source_counts[source] / len(batches)
             if source in requested:
-                metrics[f"dynamic_source_{safe_source}_requested_probability"] = float(
-                    requested[source]
-                )
-        bottlenecks = Counter(
-            batch.estimate.bottleneck_phase.split(":", 1)[0] for batch in batches
-        )
+                metrics[f"dynamic_source_{safe_source}_requested_probability"] = float(requested[source])
+        bottlenecks = Counter(batch.estimate.bottleneck_phase.split(":", 1)[0] for batch in batches)
         for phase, count in bottlenecks.items():
             metrics[f"dynamic_bottleneck_{phase}_fraction"] = count / len(batches)
         return metrics
@@ -297,11 +363,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         learning_rate=None,
     ) -> None:
         current_step = int(self.state.global_step)
-        if (
-            self.dynamic_batch_plan is not None
-            and current_step > self._last_dynamic_metrics_step
-        ):
+        if self.dynamic_batch_plan is not None and current_step > self._last_dynamic_metrics_step:
+            # CallbackHandler.on_log clears control.should_log. Preserve the
+            # Trainer decision across this additional metrics event so the
+            # base implementation still publishes its normal per-step loss,
+            # gradient norm, and learning-rate record.
+            should_log = self.control.should_log
             self.log(self._dynamic_step_metrics(current_step), start_time)
+            self.control.should_log = should_log
             self._last_dynamic_metrics_step = current_step
         return super()._maybe_log_save_evaluate(
             tr_loss,
@@ -398,6 +467,113 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return loss
 
     @override
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+        **gen_kwargs,
+    ) -> dict[str, float]:
+        resolved = self.eval_dataset if eval_dataset is None else eval_dataset
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+            **gen_kwargs,
+        )
+        if not self.dynamic_evaluation_plans or not isinstance(resolved, dict):
+            return metrics
+
+        numerators = []
+        token_counts = []
+        losses = []
+        for name in resolved:
+            prefix = f"{metric_key_prefix}_{name}"
+            numerator_key = f"{prefix}_loss_sum"
+            tokens_key = f"{prefix}_valid_target_tokens"
+            loss_key = f"{prefix}_loss"
+            if numerator_key not in metrics or tokens_key not in metrics or loss_key not in metrics:
+                raise ValueError(f"dynamic evaluation metrics are incomplete for {name!r}")
+            numerators.append(float(metrics[numerator_key]))
+            token_counts.append(float(metrics[tokens_key]))
+            losses.append(float(metrics[loss_key]))
+        aggregate = {
+            f"{metric_key_prefix}_global_loss": sum(numerators) / sum(token_counts),
+            f"{metric_key_prefix}_macro_dataset_loss": sum(losses) / len(losses),
+            f"{metric_key_prefix}_global_valid_target_tokens": sum(token_counts),
+        }
+        metrics.update(aggregate)
+        self.log(aggregate)
+        return metrics
+
+    @override
+    def evaluation_loop(
+        self,
+        dataloader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+    ):
+        dataset = getattr(dataloader, "dataset", None)
+        plan = getattr(dataset, "dynamic_evaluation_plan", None)
+        if plan is None:
+            return super().evaluation_loop(
+                dataloader,
+                description,
+                prediction_loss_only=prediction_loss_only,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+
+        self._active_dynamic_evaluation_plan = plan
+        self._dynamic_eval_loss_numerator = 0.0
+        self._dynamic_eval_valid_tokens = 0
+        self._dynamic_eval_dataset_numerators = dict.fromkeys(plan.dataset_names, 0.0)
+        self._dynamic_eval_dataset_tokens = dict.fromkeys(plan.dataset_names, 0)
+        self._dynamic_eval_microstep = 0
+        try:
+            output = super().evaluation_loop(
+                dataloader,
+                description,
+                prediction_loss_only=prediction_loss_only,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        finally:
+            self._active_dynamic_evaluation_plan = None
+
+        if self._dynamic_eval_valid_tokens <= 0:
+            raise ValueError(f"validation dataset {plan.dataset_name!r} has no valid shifted target tokens")
+        if self._dynamic_eval_microstep != len(plan.microsteps):
+            raise RuntimeError("dynamic evaluation did not execute every planned distributed microstep")
+        exact_loss = self._dynamic_eval_loss_numerator / self._dynamic_eval_valid_tokens
+        metrics = dict(output.metrics)
+        metrics[f"{metric_key_prefix}_loss"] = exact_loss
+        metrics[f"{metric_key_prefix}_global_loss"] = exact_loss
+        metrics[f"{metric_key_prefix}_loss_sum"] = self._dynamic_eval_loss_numerator
+        metrics[f"{metric_key_prefix}_valid_target_tokens"] = float(self._dynamic_eval_valid_tokens)
+        dataset_losses = []
+        for dataset_name in plan.dataset_names:
+            tokens = self._dynamic_eval_dataset_tokens[dataset_name]
+            if tokens <= 0:
+                raise ValueError(f"validation dataset {dataset_name!r} has no valid shifted target tokens")
+            numerator = self._dynamic_eval_dataset_numerators[dataset_name]
+            dataset_loss = numerator / tokens
+            dataset_losses.append(dataset_loss)
+            dataset_prefix = f"{metric_key_prefix}_{dataset_name}"
+            metrics[f"{dataset_prefix}_loss"] = dataset_loss
+            metrics[f"{dataset_prefix}_loss_sum"] = numerator
+            metrics[f"{dataset_prefix}_valid_target_tokens"] = float(tokens)
+            metrics[f"{dataset_prefix}_selected_samples"] = float(plan.selected_count_for_dataset(dataset_name))
+            metrics[f"{dataset_prefix}_rejected_samples"] = float(plan.rejected_count_for_dataset(dataset_name))
+        metrics[f"{metric_key_prefix}_macro_dataset_loss"] = sum(dataset_losses) / len(dataset_losses)
+        metrics[f"{metric_key_prefix}_selected_samples"] = float(plan.selected_count)
+        metrics[f"{metric_key_prefix}_rejected_samples"] = float(len(plan.skipped_samples))
+        metrics[f"{metric_key_prefix}_distributed_microsteps"] = float(len(plan.microsteps))
+        return output._replace(metrics=metrics, num_samples=plan.selected_count)
+
+    @override
     def prediction_step(
         self,
         model: "torch.nn.Module",
@@ -415,12 +591,74 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             labels = inputs.get("labels")
 
+        local_valid_tokens = None
+        if self._active_dynamic_evaluation_plan is not None:
+            if labels is None:
+                raise ValueError("dynamic evaluation requires labels")
+            local_valid_tokens = (labels[..., 1:] != IGNORE_INDEX).sum().to(self.accelerator.device)
+
         loss, generated_tokens, _ = super().prediction_step(
             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
         )
+        if self._active_dynamic_evaluation_plan is not None:
+            if loss is None or local_valid_tokens is None:
+                raise ValueError("dynamic evaluation requires a scalar loss")
+            plan = self._active_dynamic_evaluation_plan
+            if self._dynamic_eval_microstep >= len(plan.microsteps):
+                raise RuntimeError("dynamic evaluation executed more steps than its plan")
+            local_batch = plan.microsteps[self._dynamic_eval_microstep].local_batches[self.args.process_index]
+            dataset_names = plan.dataset_names
+            if local_batch.source_id not in dataset_names:
+                raise RuntimeError(f"dynamic evaluation batch has unknown source {local_batch.source_id!r}")
+            global_valid_tokens = local_valid_tokens.clone()
+            world_size = 1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(global_valid_tokens, op=torch.distributed.ReduceOp.SUM)
+                world_size = torch.distributed.get_world_size()
+            if int(local_valid_tokens.item()) == 0:
+                # Synchronization duplicates deliberately mask every label.
+                # Their local mean loss can be NaN (0 / 0), but their exact
+                # token-weighted contribution is zero.
+                local_numerator = torch.zeros((), dtype=torch.float64, device=self.accelerator.device)
+            else:
+                local_numerator = (
+                    loss.detach().double().to(self.accelerator.device) * global_valid_tokens.double() / world_size
+                )
+                if not torch.isfinite(local_numerator):
+                    raise FloatingPointError(
+                        "non-finite validation loss on a rank with valid target tokens: "
+                        f"dataset={local_batch.source_id!r}, "
+                        f"rank={self.args.process_index}, "
+                        f"valid_tokens={int(local_valid_tokens.item())}"
+                    )
+            dataset_values = torch.zeros(
+                2 * len(dataset_names),
+                dtype=torch.float64,
+                device=self.accelerator.device,
+            )
+            dataset_index = dataset_names.index(local_batch.source_id)
+            dataset_values[dataset_index] = local_numerator
+            dataset_values[len(dataset_names) + dataset_index] = local_valid_tokens.double()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(dataset_values, op=torch.distributed.ReduceOp.SUM)
+            for index, dataset_name in enumerate(dataset_names):
+                numerator = float(dataset_values[index].item())
+                tokens = int(dataset_values[len(dataset_names) + index].item())
+                self._dynamic_eval_dataset_numerators[dataset_name] += numerator
+                self._dynamic_eval_dataset_tokens[dataset_name] += tokens
+                self._dynamic_eval_loss_numerator += numerator
+                self._dynamic_eval_valid_tokens += tokens
+            self._dynamic_eval_microstep += 1
         if generated_tokens is not None and self.args.predict_with_generate:
             generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
             generated_tokens = generated_tokens.contiguous()
+
+        # Dynamic validation computes its exact token-weighted loss above. In
+        # loss-only evaluation, returning the rank-local labels would make the
+        # base Trainer all-gather unequal leading dimensions because dynamic
+        # batches can contain different sample counts on different ranks.
+        if self._active_dynamic_evaluation_plan is not None and prediction_loss_only:
+            labels = None
 
         return loss, generated_tokens, labels
 
