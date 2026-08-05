@@ -182,19 +182,31 @@ def configure_visual_model(config: "PretrainedConfig") -> None:
         transformers.models.llava.modeling_llava.LlavaMultiModalProjector = LlavaMultiModalProjectorForYiVL
 
 
+def _speechlmm_audio_adapter_prefixes(config: "PretrainedConfig", default: list[str]) -> list[str]:
+    """Qwen3 uses proj1/proj2; Qwen2.5 uses a single proj (+ shared ln_post)."""
+    if bool(getattr(config, "is_qwen2_5_backbone", False)) or getattr(
+        config, "backbone_type", None
+    ) == "qwen2_5_omni":
+        return ["audio_tower.proj", "audio_tower.ln_post"]
+    return list(default)
+
+
 def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "FinetuningArguments") -> set[str]:
     r"""Freeze vision tower, language model, talker, and code2wav for VLM/SpeechLMM full/freeze tuning."""
     model_type = getattr(config, "model_type", None)
     forbidden_modules = set()
     if model_type in COMPOSITE_MODELS:
         composite = COMPOSITE_MODELS[model_type]
+        audio_adapter_prefixes = _speechlmm_audio_adapter_prefixes(
+            config, composite.audio_adapter_prefixes
+        )
 
         if finetuning_args.freeze_vision_tower:
             logger.info_rank0(f"Set vision model not trainable: {composite.vision_model_keys}.")
             forbidden_modules.update(composite.vision_model_keys)
 
         if composite.audio_model_keys:
-            if composite.audio_adapter_prefixes:
+            if audio_adapter_prefixes:
                 freeze_enc = finetuning_args.freeze_audio_encoder
                 freeze_adp = finetuning_args.freeze_audio_adapters
                 if freeze_enc:
@@ -203,8 +215,8 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
                     logger.info_rank0(f"Set audio encoder not trainable: {composite.audio_model_keys}.")
                     forbidden_modules.update(composite.audio_model_keys)
                 if freeze_adp and not freeze_enc:
-                    logger.info_rank0(f"Set audio adapters not trainable: {composite.audio_adapter_prefixes}.")
-                    forbidden_modules.update(composite.audio_adapter_prefixes)
+                    logger.info_rank0(f"Set audio adapters not trainable: {audio_adapter_prefixes}.")
+                    forbidden_modules.update(audio_adapter_prefixes)
             elif finetuning_args.freeze_audio_tower:
                 logger.info_rank0(f"Set audio model not trainable: {composite.audio_model_keys}.")
                 forbidden_modules.update(composite.audio_model_keys)
@@ -263,6 +275,9 @@ def build_component_lora_targets(
         return [], {}, {}
 
     composite = COMPOSITE_MODELS[model_type]
+    audio_adapter_prefixes = _speechlmm_audio_adapter_prefixes(
+        model.config, composite.audio_adapter_prefixes
+    )
 
     ComponentSpec = tuple[str, int, int, list[str], list[str]]
     components: list[ComponentSpec] = []
@@ -274,7 +289,7 @@ def build_component_lora_targets(
                 finetuning_args.lora_audio_encoder_rank,
                 finetuning_args.lora_audio_encoder_alpha,
                 composite.audio_model_keys,
-                composite.audio_adapter_prefixes,
+                audio_adapter_prefixes,
             )
         )
 
@@ -284,7 +299,7 @@ def build_component_lora_targets(
                 "audio_adapters",
                 finetuning_args.lora_audio_adapters_rank,
                 finetuning_args.lora_audio_adapters_alpha,
-                composite.audio_adapter_prefixes,
+                audio_adapter_prefixes,
                 [],
             )
         )

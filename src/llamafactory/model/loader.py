@@ -325,33 +325,67 @@ def load_model(
             if lipread_encoder_weights is not None:
                 config_overrides["lipread_encoder_weights"] = lipread_encoder_weights
 
-            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
-            if (
-                getattr(config, "model_type", None) == "qwen3_omni_moe"
-                and finetuning_args.freeze_talker
-                and finetuning_args.freeze_code2wav
-            ):
-                from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-                    Qwen3OmniMoeThinkerForConditionalGeneration,
-                )
+            model_type = getattr(config, "model_type", None)
+            thinker_only = finetuning_args.freeze_talker and finetuning_args.freeze_code2wav
 
-                thinker_kwargs = dict(init_kwargs)
-                thinker_config = config.thinker_config
-                # The composite Thinker config inherits Transformers' generic
-                # default (True), while its authoritative text config and the
-                # checkpoint both use an independent lm_head.  Under ZeRO-3,
-                # leaving the outer default enabled makes storage-based tied-
-                # weight detection incorrectly associate the first sharded
-                # audio parameter with every Thinker tensor.
-                thinker_config.tie_word_embeddings = bool(
-                    getattr(thinker_config.text_config, "tie_word_embeddings", False)
+            if model_type == "qwen2_5_omni":
+                speechlmm_config = SpeechLMMConfig.from_qwen2_5_omni_config(
+                    config, **config_overrides
                 )
-                thinker_kwargs["config"] = thinker_config
-                with _disable_zero3_pointer_tie_inference(Qwen3OmniMoeThinkerForConditionalGeneration):
-                    qwen3_model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(**thinker_kwargs)
+                if thinker_only:
+                    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+                        Qwen2_5OmniThinkerForConditionalGeneration,
+                    )
+
+                    thinker_kwargs = dict(init_kwargs)
+                    thinker_config = config.thinker_config
+                    thinker_config.tie_word_embeddings = bool(
+                        getattr(thinker_config.text_config, "tie_word_embeddings", False)
+                    )
+                    thinker_kwargs["config"] = thinker_config
+                    with _disable_zero3_pointer_tie_inference(
+                        Qwen2_5OmniThinkerForConditionalGeneration
+                    ):
+                        qwen_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+                            **thinker_kwargs
+                        )
+                else:
+                    qwen_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+                model = SpeechLMMForConditionalGeneration._wrap_qwen2_5_omni(
+                    qwen_model, speechlmm_config
+                )
             else:
-                qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
-            model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
+                speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(
+                    config, **config_overrides
+                )
+                if thinker_only:
+                    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+                        Qwen3OmniMoeThinkerForConditionalGeneration,
+                    )
+
+                    thinker_kwargs = dict(init_kwargs)
+                    thinker_config = config.thinker_config
+                    # The composite Thinker config inherits Transformers' generic
+                    # default (True), while its authoritative text config and the
+                    # checkpoint both use an independent lm_head.  Under ZeRO-3,
+                    # leaving the outer default enabled makes storage-based tied-
+                    # weight detection incorrectly associate the first sharded
+                    # audio parameter with every Thinker tensor.
+                    thinker_config.tie_word_embeddings = bool(
+                        getattr(thinker_config.text_config, "tie_word_embeddings", False)
+                    )
+                    thinker_kwargs["config"] = thinker_config
+                    with _disable_zero3_pointer_tie_inference(
+                        Qwen3OmniMoeThinkerForConditionalGeneration
+                    ):
+                        qwen_model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+                            **thinker_kwargs
+                        )
+                else:
+                    qwen_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+                model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(
+                    qwen_model, speechlmm_config
+                )
             if lipread_encoder_weights is not None:
                 model.load_auto_avsr_weights(lipread_encoder_weights)
         else:
