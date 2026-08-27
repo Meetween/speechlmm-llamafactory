@@ -2482,6 +2482,46 @@ class LipreadProcessor:
         video = self._get_transforms()(video.data)  # [t, b, 1, H, W]
         return video[:, 0, :, :]
 
+    def count_frames(self, video_path) -> int:
+        """Return ``__call__(video_path).shape[0]`` without decoding any frame.
+
+        Placeholder expansion needs only the frame count: the pixels are
+        discarded and decoded again by the collator at training time. That count
+        is ``len(clip_start_seconds)`` in ``clips_at_regular_timestamps``, which
+        depends solely on the decoder's stream bounds, so it can be read off the
+        metadata. Sampling instead costs one seek per output frame, and these
+        lip crops carry one keyframe for the whole file, so every seek
+        re-decodes from the start.
+        """
+        from torchcodec.decoders import VideoDecoder
+
+        # No Resize here: transforms cannot move the stream bounds, and the
+        # bounds must come from the same decoder the sampler would build.
+        decoder = VideoDecoder(video_path)
+        metadata = decoder.metadata
+        begin = metadata.begin_stream_seconds
+        end = metadata.end_stream_seconds
+        if (
+            len(decoder) < 1
+            or metadata.average_fps is None
+            or end is None
+            or begin is None
+            or begin >= end
+        ):
+            # The sampler rejects these; let it raise its own error rather than
+            # inventing one, and keep this path a pure optimization.
+            return int(self(video_path).shape[0])
+
+        # Mirrors _generic_time_based_sampler with num_frames_per_clip=1:
+        # sampling_range_start is begin_stream_seconds, sampling_range_end is
+        # end_stream_seconds, and every clip contributes exactly one frame.
+        # Use torch.arange rather than a closed-form ceil so the float rounding
+        # matches the sampler exactly, including its trailing-value guard.
+        clip_starts = torch.arange(begin, end, 1 / LIPREAD_FPS)
+        if clip_starts[-1] >= end:
+            clip_starts = clip_starts[clip_starts < end]
+        return int(clip_starts.numel())
+
 
 @dataclass
 class SpeechLMMPlugin(Qwen2OmniPlugin):
@@ -2568,12 +2608,14 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         lipread_layouts: list[LipreadTokenLayout] = []
         if lipread:
             self._validate_input(processor, images, videos, input_audios, lipread=lipread)
-            mm_inputs = self._get_mm_inputs(images, videos, input_audios, processor, lipread=lipread)
+            # Only the frame counts are needed to size the placeholder spans, so
+            # stay off the decode path that _get_mm_inputs would take.
+            lipread_frames = [self.lipread_processor.count_frames(video) for video in lipread]
             num_lipread_tokens = 0
             for message in messages:
                 content = message["content"]
                 while LIPREAD_PLACEHOLDER in content:
-                    video_len = int(mm_inputs["lipread"][num_lipread_tokens].shape[0])
+                    video_len = lipread_frames[num_lipread_tokens]
                     # bos + pads + eos are all Thinker tokens for lipread spans
                     thinker_tokens = video_len + 2
                     lipread_layouts.append(
