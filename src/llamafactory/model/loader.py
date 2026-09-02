@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
@@ -28,6 +29,8 @@ from transformers import (
 from trl import AutoModelForCausalLMWithValueHead
 
 from ..extras import logging
+from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
+from speechlmm.tokens import LIPREAD_BOS_TOKEN, LIPREAD_EOS_TOKEN, LIPREAD_PAD_TOKEN
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
 from .adapter import init_adapter
@@ -123,11 +126,21 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
     return {"tokenizer": tokenizer, "processor": processor}
 
 
+def _ensure_speechlmm_registered(model_path: str) -> None:
+    r"""Register SpeechLMM with HuggingFace Auto classes before AutoConfig.load."""
+    config_file = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_file):
+        return
+    with open(config_file, encoding="utf-8") as f:
+        model_type = json.load(f).get("model_type")
+    if model_type == "speechlmm":
+        import speechlmm.models  # noqa: F401
+
+
 def load_config(model_args: "ModelArguments") -> "PretrainedConfig":
     r"""Load model config."""
     init_kwargs = _get_init_kwargs(model_args)
-    import speechlmm.models  # noqa: F401 — registers SpeechLMMConfig with AutoConfig
-
+    _ensure_speechlmm_registered(model_args.model_name_or_path)
     return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
 
 
@@ -141,7 +154,7 @@ def load_model(
     r"""Load pretrained model."""
     init_kwargs = _get_init_kwargs(model_args)
     config = load_config(model_args)
-    patch_config(config, tokenizer, model_args, init_kwargs, is_trainable)
+    patch_config(config, tokenizer, model_args, init_kwargs, is_trainable, finetuning_args=finetuning_args)
     apply_liger_kernel(config, model_args, is_trainable, require_logits=(finetuning_args.stage not in ["pt", "sft"]))
 
     model = None
@@ -177,15 +190,33 @@ def load_model(
             "qwen3_omni_moe",
         ):
             from speechlmm.models import SpeechLMMForConditionalGeneration
-            from speechlmm.models.configuration_speechlmm import SpeechLMMConfig
 
             config_overrides = {}
-            has_trainable_adapters = bool(getattr(finetuning_args, "trainable_module_paths", None))
-            if getattr(finetuning_args, "freeze_language_model", False) and not has_trainable_adapters:
+            has_trainable_adapters = bool(finetuning_args.trainable_module_paths)
+            has_trainable_lipread = (
+                not finetuning_args.freeze_lipread_encoder
+                or not finetuning_args.freeze_lipread_adapter
+            )
+            if (
+                finetuning_args.freeze_language_model
+                and not has_trainable_adapters
+                and not has_trainable_lipread
+            ):
                 config_overrides["thinker_loss_weight"] = 0.0
+
+            config_overrides["enable_lipread"] = has_trainable_lipread
+            config_overrides["lipread_bos_token_id"] = tokenizer.vocab[LIPREAD_BOS_TOKEN]
+            config_overrides["lipread_eos_token_id"] = tokenizer.vocab[LIPREAD_EOS_TOKEN]
+            config_overrides["lipread_pad_token_id"] = tokenizer.vocab[LIPREAD_PAD_TOKEN]
+            lipread_encoder_weights = getattr(model_args, "lipread_encoder_weights", None)
+            if lipread_encoder_weights is not None:
+                config_overrides["lipread_encoder_weights"] = lipread_encoder_weights
+
             speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
             qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
             model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
+            if lipread_encoder_weights is not None:
+                model.load_auto_avsr_weights(lipread_encoder_weights)
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
@@ -209,8 +240,21 @@ def load_model(
     if not lazy_load:
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
         register_autoclass(config, model, tokenizer)
+        if getattr(model.config, "model_type", None) == "speechlmm":
+            SpeechLMMConfig.sync_lipread_token_ids_from_tokenizer(model.config, tokenizer)
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
+
+    # The frozen AutoAVSR lipread encoder loses its BatchNorm running stats on load: under
+    # ZeRO-3 the 0-sized init makes transformers' storage-based tied-weight detection group
+    # every lipread param/buffer, so the BN buffers get dropped by from_pretrained (speechlmm
+    # resume) or reset by PEFT (wrapper path). Reloading the pristine .pth restores them
+    # exactly (the encoder is never trained); load_auto_avsr_weights is ZeRO-3-safe
+    # (GatheredParameters). Requires lipread_encoder_weights to be set on the resume config.
+    lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
+    if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
+        model.load_auto_avsr_weights(lipread_weights)
+        logger.info_rank0(f"Restored frozen AutoAVSR lipread encoder from {lipread_weights}")
 
     if add_valuehead:
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)

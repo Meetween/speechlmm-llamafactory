@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedTokenizer, ProcessorMixin
     from trl import AutoModelForCausalLMWithValueHead
 
-    from ..hparams import ModelArguments
+    from ..hparams import FinetuningArguments, ModelArguments
 
 if is_transformers_version_greater_than("4.57.0"):
     from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe
@@ -50,7 +50,41 @@ if is_transformers_version_greater_than("4.57.0"):
 logger = logging.get_logger(__name__)
 
 
-def patch_qwen3_omni_moe_thinker_text_sparse_moe_block():
+def _get_thinker_text_config(config: "PretrainedConfig"):
+    """Return the Thinker text config that owns fused MoE experts settings."""
+    thinker = getattr(config, "thinker_config", None)
+    if thinker is not None:
+        return getattr(thinker, "text_config", thinker)
+    return getattr(config, "text_config", config)
+
+
+def ensure_eager_thinker_experts(config: "PretrainedConfig") -> None:
+    """Force eager expert execution for fused expert LoRA.
+
+    Transformers defaults ``None`` to ``grouped_mm`` when available on CUDA, so
+    expert LoRA must explicitly override that selection to ``eager``.
+    """
+    text_config = _get_thinker_text_config(config)
+    current = getattr(text_config, "_experts_implementation", None)
+    if current not in (None, "eager", "grouped_mm", "batched_mm"):
+        raise ValueError(
+            "lora_language_model_experts requires a known experts backend, "
+            f"got config._experts_implementation={current!r}."
+        )
+    if current not in (None, "eager"):
+        logger.warning_rank0(
+            f"Overriding Thinker experts implementation {current!r} -> 'eager' "
+            "because lora_language_model_experts is enabled."
+        )
+    # Set the internal attr as well so nested subconfigs stay consistent.
+    setattr(text_config, "_experts_implementation", "eager")
+    if hasattr(text_config, "_experts_implementation_internal"):
+        text_config._experts_implementation_internal = "eager"
+
+
+def patch_qwen3_omni_moe_thinker_text_sparse_moe_block(*, allow_modulelist_patch: bool = True):
+    if not allow_modulelist_patch:
+        return
     if is_transformers_version_greater_than("4.57.0") and not is_transformers_version_greater_than("4.58.0"):
         from .model_utils.moe import Qwen3OmniMoeThinkerTextSparseMoeBlock
 
@@ -59,7 +93,6 @@ def patch_qwen3_omni_moe_thinker_text_sparse_moe_block():
         )
 
         modeling_qwen3_omni_moe.Qwen3OmniMoeThinkerTextSparseMoeBlock = Qwen3OmniMoeThinkerTextSparseMoeBlock
-
 
 def patch_youtu_vl_model(model: "PreTrainedModel") -> None:
     original_forward = model.forward
@@ -100,7 +133,7 @@ def patch_tokenizer(tokenizer: "PreTrainedTokenizer", model_args: "ModelArgument
         logger.info_rank0(
             "Add special tokens {} to tokenizer's vocabulary.".format(",".join(model_args.add_special_tokens))
         )
-        if num_added_special_tokens > 0 and not model_args.resize_vocab:
+        if num_added_special_tokens > 0 and not model_args.resize_vocab and not model_args.use_speechlmm_wrapper:
             model_args.resize_vocab = True
             logger.warning_rank0("New special tokens have been added, changed `resize_vocab` to True.")
 
@@ -129,6 +162,7 @@ def patch_config(
     model_args: "ModelArguments",
     init_kwargs: dict[str, Any],
     is_trainable: bool,
+    finetuning_args: "FinetuningArguments | None" = None,
 ) -> None:
     if model_args.compute_dtype is None:  # priority: bf16 > fp16 > fp32
         if model_args.infer_dtype != "auto" and not is_trainable:
@@ -154,6 +188,13 @@ def patch_config(
         setattr(config, "init_audio", True)
         setattr(config, "init_tts", False)
 
+    if getattr(config, "model_type", None) == "qwen2_5_omni" and is_trainable:
+        # token2wav/BigVGAN filter init is not ZeRO-3 safe (CPU vs CUDA). Training uses thinker
+        # only; loader.py unwraps `.thinker` after load.
+        setattr(config, "enable_audio_output", False)
+        if hasattr(config, "enable_talker"):
+            setattr(config, "enable_talker", False)
+
     # replace the top-k gating method
     if getattr(config, "model_type", None) == "kimi_vl" and is_trainable:
         setattr(config.text_config, "topk_method", "greedy")
@@ -177,9 +218,22 @@ def patch_config(
             "pip install git+https://github.com/huggingface/transformers.git@3c2517727ce28a30f5044e01663ee204deb1cdbe"
         )
 
-    if getattr(config, "model_type", None) in ("qwen3_omni_moe", "speechlmm"):
-        patch_qwen3_omni_moe_thinker_text_sparse_moe_block()
+    expert_lora = bool(finetuning_args is not None and getattr(finetuning_args, "lora_language_model_experts", False))
+    if expert_lora:
+        if not is_transformers_version_greater_than("5.0.0"):
+            raise ValueError(
+                "lora_language_model_experts requires Transformers >= 5.0 with fused "
+                "Qwen3OmniMoeThinkerTextExperts modules (4.x ModuleList experts are unsupported)."
+            )
+        if getattr(config, "model_type", None) not in ("qwen3_omni_moe", "speechlmm"):
+            raise ValueError(
+                "lora_language_model_experts is only supported for qwen3_omni_moe / speechlmm models."
+            )
+        ensure_eager_thinker_experts(config)
 
+    if getattr(config, "model_type", None) in ("qwen3_omni_moe", "speechlmm"):
+        # Expert LoRA needs the fused TF>=5 layout; never apply the 4.57 ModuleList patch.
+        patch_qwen3_omni_moe_thinker_text_sparse_moe_block(allow_modulelist_patch=not expert_lora)
     # deepspeed zero3 is not compatible with low_cpu_mem_usage
     init_kwargs["low_cpu_mem_usage"] = model_args.low_cpu_mem_usage and (not is_deepspeed_zero3_enabled())
 

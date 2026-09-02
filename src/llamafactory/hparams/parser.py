@@ -139,6 +139,33 @@ def _verify_model_args(
         if model_args.adapter_name_or_path is not None and len(model_args.adapter_name_or_path) != 1:
             raise ValueError("Quantized model only accepts a single adapter. Merge them first.")
 
+    if getattr(finetuning_args, "lora_language_model_experts", False):
+        if finetuning_args.finetuning_type != "lora":
+            raise ValueError("lora_language_model_experts requires finetuning_type='lora'.")
+        if not getattr(finetuning_args, "lora_language_model", False):
+            raise ValueError("lora_language_model_experts requires lora_language_model=True.")
+        if model_args.quantization_bit is not None:
+            raise ValueError("lora_language_model_experts does not support quantized base weights.")
+        if model_args.use_unsloth:
+            raise ValueError("lora_language_model_experts is not supported with Unsloth.")
+        if model_args.use_kt:
+            raise ValueError("lora_language_model_experts is not supported with KTransformers.")
+        if finetuning_args.use_dora:
+            raise ValueError("lora_language_model_experts does not support DoRA.")
+        if finetuning_args.pissa_init:
+            raise ValueError("lora_language_model_experts does not support PiSSA initialization.")
+        init_weights = getattr(finetuning_args, "init_lora_weights", True)
+        if init_weights not in (True, False, "gaussian", None):
+            raise ValueError(
+                "lora_language_model_experts only supports standard LoRA initialization "
+                "(true / false / gaussian)."
+            )
+        if model_args.adapter_name_or_path is not None and len(model_args.adapter_name_or_path) > 1:
+            raise ValueError(
+                "lora_language_model_experts supports a single adapter under ZeRO-3; "
+                "merge multiple adapters before loading."
+            )
+
 
 def _check_extra_dependencies(
     model_args: "ModelArguments",
