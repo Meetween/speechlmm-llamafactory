@@ -212,9 +212,23 @@ def load_model(
             if lipread_encoder_weights is not None:
                 config_overrides["lipread_encoder_weights"] = lipread_encoder_weights
 
-            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
-            qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
-            model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
+            model_type = getattr(config, "model_type", None)
+            if model_type == "qwen2_5_omni":
+                speechlmm_config = SpeechLMMConfig.from_qwen2_5_omni_config(
+                    config, **config_overrides
+                )
+                qwen_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+                model = SpeechLMMForConditionalGeneration._wrap_qwen2_5_omni(
+                    qwen_model, speechlmm_config
+                )
+            else:
+                speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(
+                    config, **config_overrides
+                )
+                qwen_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
+                model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(
+                    qwen_model, speechlmm_config
+                )
             if lipread_encoder_weights is not None:
                 model.load_auto_avsr_weights(lipread_encoder_weights)
         else:
