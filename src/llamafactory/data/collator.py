@@ -53,6 +53,56 @@ def _invert_feat_extract_output_length(output_len: int, forward_fn) -> int:
     return lo
 
 
+def _feat_extract_output_length_fn(config: Any):
+    r"""Return the audio-tower output-length mapping of the backbone in *config*.
+
+    Qwen2.5-Omni and Qwen3-Omni-MoE do not agree on this function. Qwen2.5
+    stacks two stride-2 convolutions --
+    ``((L - 1) // 2 + 1 - 2) // 2 + 1``, `modeling_qwen2_5_omni.py:884` -- while
+    Qwen3 chunks the input at 100 frames and emits 13 outputs per whole chunk,
+    `modeling_qwen3_omni_moe.py:145`. The same placeholder count therefore
+    inverts to a very different raw feature length: 25 placeholders mean ~190
+    frames under Qwen3 but ~100 under Qwen2.5.
+
+    That matters because `get_rope_index` re-applies its *own* backbone's
+    formula to whatever `audio_seqlens` we hand it. Using Qwen3's mapping under
+    a Qwen2.5 backbone desynchronises `llm_positions` from the unmasked token
+    count, and the error surfaces deep inside `get_rope_index` as a broadcast
+    failure rather than anywhere near this file -- job 21961135 died on
+    "value tensor of shape [3, 297] cannot be broadcast to indexing result of
+    shape [3, 225]" at the first optimizer step of stage 00b.
+    """
+    from speechlmm.models.configuration_speechlmm import (
+        QWEN2_5_OMNI_BACKBONE,
+        resolve_backbone,
+    )
+
+    # Resolved exactly the way ``backbone_modules()`` resolves the class whose
+    # ``get_rope_index`` will consume ``audio_seqlens``, so the two cannot
+    # disagree -- including on the ``backbone is None`` default, which
+    # ``_BACKBONE_ALIASES`` maps to Qwen3 for configs written before Qwen2.5
+    # support. A bare thinker config carries the backbone in its ``model_type``.
+    model_type = getattr(config, "model_type", None)
+    name = getattr(config, "backbone", None) if model_type == "speechlmm" else model_type
+    is_qwen2_5 = resolve_backbone(name) == QWEN2_5_OMNI_BACKBONE
+
+    if is_qwen2_5:
+        # Mirrors Qwen2_5OmniAudioEncoder._get_feat_extract_output_lengths,
+        # which is an instance method that ignores ``self``; inlining the two
+        # convolution strides avoids calling it unbound.
+        def _qwen2_5_output_lengths(input_lengths):
+            input_lengths = (input_lengths - 1) // 2 + 1
+            return (input_lengths - 2) // 2 + 1
+
+        return _qwen2_5_output_lengths
+
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        _get_feat_extract_output_lengths,
+    )
+
+    return _get_feat_extract_output_lengths
+
+
 def _audio_seqlens_from_input_ids(
     input_ids: "torch.Tensor",
     attention_mask: "torch.Tensor",
@@ -64,9 +114,7 @@ def _audio_seqlens_from_input_ids(
     then inverts through the same `_get_feat_extract_output_lengths` that `get_rope_index`
     uses, so alignment is guaranteed by construction.
     """
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        _get_feat_extract_output_lengths,
-    )
+    _get_feat_extract_output_lengths = _feat_extract_output_length_fn(config)
 
     audio_start_id = getattr(config, "audio_start_token_id", None)
     audio_token_id = getattr(config, "audio_token_id", None)
@@ -115,9 +163,7 @@ def _reconcile_audio_placeholder_tokens(
     if feature_attention_mask is None:
         return
 
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        _get_feat_extract_output_lengths,
-    )
+    _get_feat_extract_output_lengths = _feat_extract_output_length_fn(config)
 
     expected_counts = [
         int(_get_feat_extract_output_lengths(int(length))) for length in feature_attention_mask.sum(dim=-1).tolist()

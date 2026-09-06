@@ -193,25 +193,38 @@ class SaveTrainableModulesCallback(TrainerCallback):
             raise ValueError("periodic_save_steps must be positive when set")
         self.periodic_save_steps = int(periodic_save_steps) if periodic_save_steps is not None else None
         self._last_periodic_step = -1
-        self.stage_base_delta = None
-        self.stage_base_delta_sha256 = None
+        # A stage may inherit the published modules of several earlier stages
+        # (comma separated), so every inherited delta is tracked and all of them
+        # are re-published with this stage's own updates.
+        self.stage_base_deltas: list[str] = []
+        self.stage_base_delta_sha256: list[str] = []
         self.inherited_keys: set[str] = set()
         if stage_base_delta is not None:
             from pathlib import Path
 
-            delta_path = Path(stage_base_delta)
-            if delta_path.is_dir():
-                delta_path = delta_path / TRAINABLE_MODULES_FILENAME
-            if not delta_path.is_file():
-                raise ValueError(f"Stage base delta does not exist: {delta_path}")
-            with safe_open(str(delta_path), framework="pt", device="cpu") as handle:
-                self.inherited_keys = set(handle.keys())
-            digest = hashlib.sha256()
-            with delta_path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-            self.stage_base_delta = str(delta_path.resolve())
-            self.stage_base_delta_sha256 = digest.hexdigest()
+            entries = [entry.strip() for entry in str(stage_base_delta).split(",") if entry.strip()]
+            if not entries:
+                raise ValueError(f"stage_base_delta is empty: {stage_base_delta!r}")
+            for entry in entries:
+                delta_path = Path(entry)
+                if delta_path.is_dir():
+                    delta_path = delta_path / TRAINABLE_MODULES_FILENAME
+                if not delta_path.is_file():
+                    raise ValueError(f"Stage base delta does not exist: {delta_path}")
+                with safe_open(str(delta_path), framework="pt", device="cpu") as handle:
+                    keys = set(handle.keys())
+                collisions = sorted(keys & self.inherited_keys)
+                if collisions:
+                    raise ValueError(
+                        f"Inherited deltas overlap on {collisions[:10]}: {delta_path}"
+                    )
+                self.inherited_keys |= keys
+                digest = hashlib.sha256()
+                with delta_path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                self.stage_base_deltas.append(str(delta_path.resolve()))
+                self.stage_base_delta_sha256.append(digest.hexdigest())
 
     @staticmethod
     def _canonical_name(name: str) -> str:
@@ -281,9 +294,10 @@ class SaveTrainableModulesCallback(TrainerCallback):
 
         is_main = self._is_main_process()
         state = {}
-        if self.stage_base_delta is not None and is_main:
-            with safe_open(self.stage_base_delta, framework="pt", device="cpu") as handle:
-                state.update({key: handle.get_tensor(key) for key in handle.keys()})
+        if self.stage_base_deltas and is_main:
+            for delta in self.stage_base_deltas:
+                with safe_open(delta, framework="pt", device="cpu") as handle:
+                    state.update({key: handle.get_tensor(key) for key in handle.keys()})
 
         # Frozen inherited weights are already represented exactly by the
         # Stage-1 file. Only capture parameters that can have changed in this
@@ -312,7 +326,7 @@ class SaveTrainableModulesCallback(TrainerCallback):
         if state and is_main:
             os.makedirs(output_dir, exist_ok=True)
             save_file(state, os.path.join(output_dir, TRAINABLE_MODULES_FILENAME), metadata={"format": "pt"})
-            if self.stage_base_delta is not None:
+            if self.stage_base_deltas:
                 with open(
                     os.path.join(output_dir, "staged_training.json"),
                     "w",
@@ -321,7 +335,7 @@ class SaveTrainableModulesCallback(TrainerCallback):
                     json.dump(
                         {
                             "schema_version": 1,
-                            "stage_base_delta": self.stage_base_delta,
+                            "stage_base_delta": self.stage_base_deltas,
                             "stage_base_delta_sha256": self.stage_base_delta_sha256,
                             "inherited_tensor_count": len(self.inherited_keys),
                         },

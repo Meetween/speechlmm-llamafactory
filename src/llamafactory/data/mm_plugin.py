@@ -196,6 +196,27 @@ def _make_batched_images(images: list["ImageObject"], imglens: list[int]) -> lis
     return batch_images
 
 
+MEDIA_ROOT_ENV = "SPEECHLMM_MEDIA_ROOT"
+
+
+def resolve_media_path(media):
+    """Resolve a relative media path against ``$SPEECHLMM_MEDIA_ROOT``.
+
+    Preparation records media paths relative to the corpus root. A merged
+    prepared bundle rewrote them to absolute paths while merging Arrow, but a
+    linked (hardlinked) view keeps the rows exactly as prepared, so the runtime
+    has to supply the root; the trainer exports it from ``data_args.media_dir``.
+    Absolute paths and non-path inputs (arrays, PIL images, bytes, file objects)
+    pass through untouched.
+    """
+    if not isinstance(media, str):
+        return media
+    root = os.environ.get(MEDIA_ROOT_ENV, "")
+    if not root or os.path.isabs(media):
+        return media
+    return os.path.join(root, media)
+
+
 def _check_video_is_nested_images(video: "VideoInput") -> bool:
     r"""Check if the video is nested images."""
     return isinstance(video, list) and all(isinstance(frame, (str, BinaryIO, dict, ImageObject)) for frame in video)
@@ -313,6 +334,7 @@ class MMPluginMixin:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
         results = []
         for image in images:
+            image = resolve_media_path(image)
             if isinstance(image, (str, BinaryIO)):
                 image = Image.open(image)
             elif isinstance(image, bytes):
@@ -335,6 +357,7 @@ class MMPluginMixin:
         results = []
         durations = []
         for video in videos:
+            video = resolve_media_path(video)
             frames: list[ImageObject] = []
             if _check_video_is_nested_images(video):
                 for frame in video:
@@ -367,6 +390,7 @@ class MMPluginMixin:
         r"""Regularizes audios to avoid error. Including reading and resampling."""
         results, sampling_rates = [], []
         for audio in audios:
+            audio = resolve_media_path(audio)
             if not isinstance(audio, np.ndarray):
                 audio, sr = torchaudio.load(audio)
                 if audio.shape[0] > 1:
@@ -1796,6 +1820,7 @@ class Qwen2VLPlugin(BasePlugin):
     def _regularize_videos(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
         results, fps_per_video, durations = [], [], []
         for video in videos:
+            video = resolve_media_path(video)
             frames: list[ImageObject] = []
             if _check_video_is_nested_images(video):
                 for frame in video:
@@ -2221,6 +2246,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         fallback_indices: list[int] = []
 
         for index, audio in enumerate(audios):
+            audio = resolve_media_path(audio)
             input_samples = None
             if isinstance(audio, np.ndarray):
                 input_samples = int(audio.shape[-1])
@@ -2477,6 +2503,7 @@ class LipreadProcessor:
         from torchcodec.samplers import clips_at_regular_timestamps
         from torchcodec.transforms import Resize
 
+        video_path = resolve_media_path(video_path)
         video_dec = VideoDecoder(video_path, transforms=[Resize((self.H, self.W))])
         video = clips_at_regular_timestamps(video_dec, seconds_between_clip_starts=1 / LIPREAD_FPS)
         video = self._get_transforms()(video.data)  # [t, b, 1, H, W]
@@ -2497,7 +2524,7 @@ class LipreadProcessor:
 
         # No Resize here: transforms cannot move the stream bounds, and the
         # bounds must come from the same decoder the sampler would build.
-        decoder = VideoDecoder(video_path)
+        decoder = VideoDecoder(resolve_media_path(video_path))
         metadata = decoder.metadata
         begin = metadata.begin_stream_seconds
         end = metadata.end_stream_seconds

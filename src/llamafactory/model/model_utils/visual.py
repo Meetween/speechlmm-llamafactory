@@ -627,7 +627,14 @@ _register_composite_model(
     language_model_keys=["model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
     audio_model_keys=["audio_tower"],
-    audio_adapter_prefixes=["audio_tower.proj1", "audio_tower.proj2", "audio_tower.ln_post"],
+    # Qwen3-Omni: proj1/proj2/ln_post; Qwen2.5-Omni: proj/ln_post. Names that
+    # the active backbone does not have never match anything.
+    audio_adapter_prefixes=[
+        "audio_tower.proj",
+        "audio_tower.proj1",
+        "audio_tower.proj2",
+        "audio_tower.ln_post",
+    ],
     lipread_model_keys=["lipread_encoder"],
     lipread_adapter_keys=["lipread_adapter"],
     talker_keys=["talker"],

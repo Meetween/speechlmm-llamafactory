@@ -21,6 +21,7 @@ import torch.distributed as dist
 from transformers import EarlyStoppingCallback, PreTrainedModel
 
 from ..data import get_template_and_fix_tokenizer
+from ..data.mm_plugin import MEDIA_ROOT_ENV
 from ..extras import logging
 from ..extras.constants import V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
 from ..extras.misc import find_available_port, get_device_name, get_torch_device, infer_optim_dtype
@@ -58,6 +59,12 @@ def _training_function(config: dict[str, Any]) -> None:
     args = config.get("args")
     callbacks: list[Any] = config.get("callbacks")
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
+
+    # Prepared rows may carry media paths relative to the corpus root (a linked
+    # view keeps them as prepared instead of rewriting them to absolute), so the
+    # multimodal plugins resolve them against this root at load time.
+    if data_args.media_dir:
+        os.environ.setdefault(MEDIA_ROOT_ENV, str(data_args.media_dir))
 
     callbacks.append(LogCallback())
     if finetuning_args.pissa_convert:
