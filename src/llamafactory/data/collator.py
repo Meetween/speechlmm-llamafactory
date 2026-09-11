@@ -206,18 +206,24 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if (
             self.template.mm_plugin.audio_token is not None and sum(batch_audlens) == 0
         ):  # avoid process hanging in zero3/fsdp case
-            fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
+            # Always extract dummy mel so every rank still runs the audio tower.
+            # SpeechLMM does *not* put dummy tokens in the LM sequence: lipread-only
+            # loss must not update audio LoRA via attention. Native Qwen still
+            # injects placeholders so transformers scatter stays aligned.
             fake_audios = [np.zeros(1600)]
-            fake_messages = self.template.mm_plugin.process_messages(
-                fake_messages, [], [], fake_audios, self.processor
-            )
-            _fake_input_ids = self.tokenizer.encode(fake_messages[0]["content"], add_special_tokens=False)
-            _fake_input_ids, _ = self.template.mm_plugin.process_token_ids(
-                _fake_input_ids, None, [], [], fake_audios, self.tokenizer, self.processor
-            )
-            fake_input_ids.extend(_fake_input_ids)
             batch_audios = fake_audios
             batch_audlens[0] = 1
+            model_type = getattr(getattr(self.model, "config", None), "model_type", None)
+            if model_type != "speechlmm":
+                fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
+                fake_messages = self.template.mm_plugin.process_messages(
+                    fake_messages, [], [], fake_audios, self.processor
+                )
+                _fake_input_ids = self.tokenizer.encode(fake_messages[0]["content"], add_special_tokens=False)
+                _fake_input_ids, _ = self.template.mm_plugin.process_token_ids(
+                    _fake_input_ids, None, [], [], fake_audios, self.tokenizer, self.processor
+                )
+                fake_input_ids.extend(_fake_input_ids)
 
         if len(fake_input_ids) != 0:
             if self.tokenizer.padding_side == "right":
@@ -273,8 +279,17 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                     self.model.config,
                 )
                 if audio_seqlens is None:
+                    # Dummy ZeRO-3 audio has feature_attention_mask but no audio
+                    # tokens; do not feed those lengths to rope.
+                    thinker = getattr(self.model.config, "thinker_config", None)
+                    audio_token_id = getattr(self.model.config, "audio_token_id", None) or (
+                        getattr(thinker, "audio_token_id", None) if thinker else None
+                    )
+                    has_audio_tokens = (
+                        audio_token_id is not None and (features["input_ids"] == audio_token_id).any()
+                    )
                     feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
-                    if feature_attention_mask is not None:
+                    if has_audio_tokens and feature_attention_mask is not None:
                         audio_seqlens = torch.sum(feature_attention_mask, dim=-1)
                 if audio_seqlens is not None:
                     rope_index_kwargs["audio_seqlens"] = audio_seqlens
