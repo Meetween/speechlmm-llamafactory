@@ -26,6 +26,8 @@ from transformers.activations import ACT2FN
 from ...extras import logging
 from ...extras.packages import is_transformers_version_greater_than
 
+from .moe import config_is_qwen2_5_backbone
+
 
 if TYPE_CHECKING:
     from transformers import LlavaConfig, PretrainedConfig, PreTrainedModel
@@ -184,9 +186,7 @@ def configure_visual_model(config: "PretrainedConfig") -> None:
 
 def _speechlmm_audio_adapter_prefixes(config: "PretrainedConfig", default: list[str]) -> list[str]:
     """Qwen3 uses proj1/proj2; Qwen2.5 uses a single proj (+ shared ln_post)."""
-    if bool(getattr(config, "is_qwen2_5_backbone", False)) or getattr(
-        config, "backbone_type", None
-    ) == "qwen2_5_omni":
+    if config_is_qwen2_5_backbone(config):
         return ["audio_tower.proj", "audio_tower.ln_post"]
     return list(default)
 

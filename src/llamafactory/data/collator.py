@@ -28,6 +28,7 @@ from speechlmm.tokens import LIPREAD_FRAME_SIZE
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
+from ..model.model_utils.moe import config_is_qwen2_5_backbone
 
 
 if is_pillow_available():
@@ -53,15 +54,7 @@ def _feat_extract_output_length_fn(config: Any):
     chunks worth 13 tokens, so using Qwen3's formula on a Qwen2.5 model yields the
     wrong audio token count and get_rope_index fails with a shape mismatch.
     """
-    if getattr(config, "is_qwen2_5_backbone", False) or getattr(config, "backbone_type", None) == "qwen2_5_omni":
-        return _qwen2_5_feat_extract_output_lengths
-
-    thinker = getattr(config, "thinker_config", None)
-    model_types = {
-        getattr(config, "model_type", None),
-        getattr(thinker, "model_type", None) if thinker is not None else None,
-    }
-    if model_types & {"qwen2_5_omni", "qwen2_5_omni_thinker"}:
+    if config_is_qwen2_5_backbone(config):
         return _qwen2_5_feat_extract_output_lengths
 
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
@@ -161,8 +154,14 @@ def _reconcile_audio_placeholder_tokens(
     if audio_start_id is None or audio_end_id is None or audio_token_id is None:
         return
 
+    if len(features) != len(batch_audlens):
+        raise ValueError(
+            "Prepared features do not match audio counts: "
+            f"features={len(features)}, audios={len(batch_audlens)}"
+        )
+
     audio_offset = 0
-    for feature, audio_count in zip(features, batch_audlens, strict=True):
+    for feature, audio_count in zip(features, batch_audlens):
         if audio_count == 0:
             continue
         input_ids = feature["input_ids"]
@@ -342,7 +341,6 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         )
         if self.model is not None:
             _reconcile_audio_placeholder_tokens(features, batch_audlens, mm_inputs, self.model.config)
-            batch_input_ids = [feature["input_ids"] for feature in features]
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
             for i, feature in enumerate(features):
