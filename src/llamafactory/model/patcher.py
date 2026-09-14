@@ -29,7 +29,7 @@ from .model_utils.checkpointing import prepare_model_for_training
 from .model_utils.embedding import resize_embedding_layer
 from .model_utils.kv_cache import configure_kv_cache
 from .model_utils.longlora import configure_longlora
-from .model_utils.moe import add_z3_leaf_module, configure_moe
+from .model_utils.moe import add_z3_leaf_module, config_uses_qwen3_omni_moe_blocks, configure_moe
 from .model_utils.packing import configure_packing
 from .model_utils.quantization import configure_quantization
 from .model_utils.rope import configure_rope
@@ -225,13 +225,14 @@ def patch_config(
                 "lora_language_model_experts requires Transformers >= 5.0 with fused "
                 "Qwen3OmniMoeThinkerTextExperts modules (4.x ModuleList experts are unsupported)."
             )
-        if getattr(config, "model_type", None) not in ("qwen3_omni_moe", "speechlmm"):
+        if not config_uses_qwen3_omni_moe_blocks(config):
             raise ValueError(
-                "lora_language_model_experts is only supported for qwen3_omni_moe / speechlmm models."
+                "lora_language_model_experts is only supported for Qwen3 Omni MoE "
+                "(native qwen3_omni_moe or SpeechLMM with a Qwen3 backbone)."
             )
         ensure_eager_thinker_experts(config)
 
-    if getattr(config, "model_type", None) in ("qwen3_omni_moe", "speechlmm"):
+    if config_uses_qwen3_omni_moe_blocks(config):
         # Expert LoRA needs the fused TF>=5 layout; never apply the 4.57 ModuleList patch.
         patch_qwen3_omni_moe_thinker_text_sparse_moe_block(allow_modulelist_patch=not expert_lora)
     # deepspeed zero3 is not compatible with low_cpu_mem_usage

@@ -33,6 +33,24 @@ if is_transformers_version_greater_than("4.57.0"):
     from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe
 
 
+def config_uses_qwen3_omni_moe_blocks(config: "PretrainedConfig") -> bool:
+    """True when the (wrapped) model actually contains Qwen3 Omni MoE expert blocks.
+
+    SpeechLMM keeps Hugging Face ``model_type="speechlmm"`` for both Qwen2.5 (dense)
+    and Qwen3 (MoE). Discriminate on ``backbone_type`` / ``is_qwen2_5_backbone``.
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type in ("qwen3_omni_moe", "qwen3_omni_moe_thinker"):
+        return True
+    if model_type != "speechlmm":
+        return False
+    if bool(getattr(config, "is_qwen2_5_backbone", False)):
+        return False
+    if getattr(config, "backbone_type", None) == "qwen2_5_omni":
+        return False
+    return True
+
+
 def _set_z3_leaf_modules(model: "PreTrainedModel", leaf_modules: list[Union["nn.Module", str]]) -> None:
     check_version("deepspeed>=0.13.0")
     from deepspeed.utils import set_z3_leaf_modules  # type: ignore
@@ -132,7 +150,7 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
 
         _set_z3_leaf_modules(model, [Qwen3VLMoeTextSparseMoeBlock])
 
-    if model_type in ("qwen3_omni_moe", "qwen3_omni_moe_thinker", "speechlmm"):
+    if config_uses_qwen3_omni_moe_blocks(model.config):
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
             Qwen3OmniMoeThinkerTextSparseMoeBlock,
         )
@@ -141,7 +159,10 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
         # expert weights gathered).  Do NOT mark audio encoder modules as Z3
         # leaves — they are standard transformer layers and making them leaves
         # prevents gradients from flowing to any trainable params inside.
-        _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
+        # Skip when the class is absent (dense SpeechLMM Qwen2.5); DeepSpeed
+        # raises if we register a leaf type that is not in the module tree.
+        if any(isinstance(module, Qwen3OmniMoeThinkerTextSparseMoeBlock) for module in model.modules()):
+            _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
 
 
 def configure_moe(config: "PretrainedConfig", model_args: "ModelArguments", is_trainable: bool) -> None:
