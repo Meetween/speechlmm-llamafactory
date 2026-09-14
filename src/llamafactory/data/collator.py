@@ -28,6 +28,7 @@ from speechlmm.tokens import LIPREAD_FRAME_SIZE
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
+from ..model.model_utils.moe import config_is_qwen2_5_backbone
 
 
 if is_pillow_available():
@@ -38,6 +39,29 @@ if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
     from .template import Template
+
+
+def _qwen2_5_feat_extract_output_lengths(input_lengths: int) -> int:
+    r"""Qwen2.5-Omni audio frames -> audio tokens (output length only)."""
+    input_lengths = (input_lengths - 1) // 2 + 1
+    return (input_lengths - 2) // 2 + 1
+
+
+def _feat_extract_output_length_fn(config: Any):
+    r"""Pick the frames -> tokens mapping matching the backbone.
+
+    Qwen2.5 downsamples uniformly while Qwen3's AuT encoder consumes 100-frame
+    chunks worth 13 tokens, so using Qwen3's formula on a Qwen2.5 model yields the
+    wrong audio token count and get_rope_index fails with a shape mismatch.
+    """
+    if config_is_qwen2_5_backbone(config):
+        return _qwen2_5_feat_extract_output_lengths
+
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        _get_feat_extract_output_lengths,
+    )
+
+    return _get_feat_extract_output_lengths
 
 
 def _invert_feat_extract_output_length(output_len: int, forward_fn) -> int:
@@ -65,9 +89,7 @@ def _audio_seqlens_from_input_ids(
     then inverts through the same `_get_feat_extract_output_lengths` that `get_rope_index`
     uses, so alignment is guaranteed by construction.
     """
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        _get_feat_extract_output_lengths,
-    )
+    _get_feat_extract_output_lengths = _feat_extract_output_length_fn(config)
 
     audio_start_id = getattr(config, "audio_start_token_id", None)
     audio_token_id = getattr(config, "audio_token_id", None)
@@ -97,6 +119,81 @@ def _audio_seqlens_from_input_ids(
     if not seqlens:
         return None
     return torch.tensor(seqlens, device=input_ids.device, dtype=torch.long)
+
+
+def _reconcile_audio_placeholder_tokens(
+    features: list[dict[str, Any]],
+    batch_audlens: list[int],
+    mm_inputs: dict[str, Any],
+    config: Any,
+) -> None:
+    r"""Make prepared audio placeholders match the features decoded at runtime.
+
+    Prepared datasets may carry a different placeholder count than the decoded
+    audio (e.g. caches tokenized with another backbone's hop rounding), so the
+    ignored placeholder span is reconciled before padding.
+    """
+    feature_attention_mask = mm_inputs.get("feature_attention_mask")
+    if feature_attention_mask is None:
+        return
+
+    _get_feat_extract_output_lengths = _feat_extract_output_length_fn(config)
+
+    expected_counts = [
+        int(_get_feat_extract_output_lengths(int(length))) for length in feature_attention_mask.sum(dim=-1).tolist()
+    ]
+    if len(expected_counts) != sum(batch_audlens):
+        raise ValueError(
+            "Decoded audio count does not match the prepared batch: "
+            f"decoded={len(expected_counts)}, prepared={sum(batch_audlens)}"
+        )
+
+    audio_start_id = getattr(config, "audio_start_token_id", None)
+    audio_end_id = getattr(config, "audio_end_token_id", None)
+    audio_token_id = getattr(config, "audio_token_id", None)
+    if audio_start_id is None or audio_end_id is None or audio_token_id is None:
+        return
+
+    if len(features) != len(batch_audlens):
+        raise ValueError(
+            "Prepared features do not match audio counts: "
+            f"features={len(features)}, audios={len(batch_audlens)}"
+        )
+
+    audio_offset = 0
+    for feature, audio_count in zip(features, batch_audlens):
+        if audio_count == 0:
+            continue
+        input_ids = feature["input_ids"]
+        starts = [index for index, token in enumerate(input_ids) if token == audio_start_id]
+        ends = [index for index, token in enumerate(input_ids) if token == audio_end_id]
+        if len(starts) != audio_count or len(ends) != audio_count:
+            raise ValueError(
+                "Prepared audio spans do not match media references: "
+                f"starts={len(starts)}, ends={len(ends)}, audios={audio_count}"
+            )
+
+        for local_index in range(audio_count - 1, -1, -1):
+            start = starts[local_index]
+            end = ends[local_index]
+            if end <= start:
+                raise ValueError("Prepared audio span ends before it starts.")
+            positions = [index for index in range(start + 1, end) if feature["input_ids"][index] == audio_token_id]
+            expected = expected_counts[audio_offset + local_index]
+            delta = expected - len(positions)
+            if delta < 0:
+                remove = set(positions[delta:])
+                for name in ("input_ids", "attention_mask", "labels"):
+                    if name in feature:
+                        feature[name] = [value for index, value in enumerate(feature[name]) if index not in remove]
+            elif delta > 0:
+                insertion = end
+                feature["input_ids"][insertion:insertion] = [audio_token_id] * delta
+                if "attention_mask" in feature:
+                    feature["attention_mask"][insertion:insertion] = [1] * delta
+                if "labels" in feature:
+                    feature["labels"][insertion:insertion] = [IGNORE_INDEX] * delta
+        audio_offset += audio_count
 
 
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
@@ -242,6 +339,8 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             self.processor,
             lipread=batch_lipread,
         )
+        if self.model is not None:
+            _reconcile_audio_placeholder_tokens(features, batch_audlens, mm_inputs, self.model.config)
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
             for i, feature in enumerate(features):
