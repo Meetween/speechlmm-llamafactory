@@ -266,7 +266,7 @@ def load_model(
     # exactly (the encoder is never trained); load_auto_avsr_weights is ZeRO-3-safe
     # (GatheredParameters). Requires lipread_encoder_weights to be set on the resume config.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
-    if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
+    if lipread_weights and finetuning_args.freeze_lipread_encoder and hasattr(model, "load_auto_avsr_weights"):
         model.load_auto_avsr_weights(lipread_weights)
         logger.info_rank0(f"Restored frozen AutoAVSR lipread encoder from {lipread_weights}")
 

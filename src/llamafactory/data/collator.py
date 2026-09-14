@@ -153,6 +153,8 @@ def _reconcile_audio_placeholder_tokens(
     audio_token_id = getattr(config, "audio_token_id", None)
     if audio_start_id is None or audio_end_id is None or audio_token_id is None:
         return
+    if not any(audio_token_id in feature["input_ids"] for feature in features):
+        return
 
     if len(features) != len(batch_audlens):
         raise ValueError(
@@ -303,18 +305,20 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if (
             self.template.mm_plugin.audio_token is not None and sum(batch_audlens) == 0
         ):  # avoid process hanging in zero3/fsdp case
-            fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
             fake_audios = [np.zeros(1600)]
-            fake_messages = self.template.mm_plugin.process_messages(
-                fake_messages, [], [], fake_audios, self.processor
-            )
-            _fake_input_ids = self.tokenizer.encode(fake_messages[0]["content"], add_special_tokens=False)
-            _fake_input_ids, _ = self.template.mm_plugin.process_token_ids(
-                _fake_input_ids, None, [], [], fake_audios, self.tokenizer, self.processor
-            )
-            fake_input_ids.extend(_fake_input_ids)
             batch_audios = fake_audios
             batch_audlens[0] = 1
+            model_type = getattr(getattr(self.model, "config", None), "model_type", None)
+            if model_type != "speechlmm":
+                fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
+                fake_messages = self.template.mm_plugin.process_messages(
+                    fake_messages, [], [], fake_audios, self.processor
+                )
+                _fake_input_ids = self.tokenizer.encode(fake_messages[0]["content"], add_special_tokens=False)
+                _fake_input_ids, _ = self.template.mm_plugin.process_token_ids(
+                    _fake_input_ids, None, [], [], fake_audios, self.tokenizer, self.processor
+                )
+                fake_input_ids.extend(_fake_input_ids)
 
         if len(fake_input_ids) != 0:
             if self.tokenizer.padding_side == "right":
@@ -373,7 +377,9 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 )
                 if audio_seqlens is None:
                     feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
-                    if feature_attention_mask is not None:
+                    audio_token_id = getattr(self.model.config, "audio_token_id", None)
+                    has_audio_tokens = audio_token_id is not None and (features["input_ids"] == audio_token_id).any()
+                    if has_audio_tokens and feature_attention_mask is not None:
                         audio_seqlens = torch.sum(feature_attention_mask, dim=-1)
                 if audio_seqlens is not None:
                     rope_index_kwargs["audio_seqlens"] = audio_seqlens
@@ -441,6 +447,14 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
             features["lipread"] = lipread_padded
             features["lipread_mask"] = lipread_mask
+        elif self.model is not None:
+            lipread_modules = (
+                getattr(self.model, "lipread_encoder", None),
+                getattr(self.model, "lipread_adapter", None),
+            )
+            if any(module is not None and any(param.requires_grad for param in module.parameters()) for module in lipread_modules):
+                features["lipread"] = torch.zeros((1, 16, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE))
+                features["lipread_mask"] = torch.ones((1, 16, 16), dtype=torch.uint8)
         return features
 
 
