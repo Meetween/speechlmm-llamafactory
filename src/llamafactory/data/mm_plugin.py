@@ -106,6 +106,12 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+# Length of the silence substituted for an audio file that fails to decode and
+# whose container metadata is also unreadable (1 second at 16 kHz).  Only the
+# consistency of this value matters, not the value itself -- see
+# MMPluginMixin._silence_for_undecodable_audio.
+UNDECODABLE_AUDIO_FALLBACK_SAMPLES = 16000
+
 
 @dataclass(frozen=True)
 class AudioTokenLayout:
@@ -384,6 +390,44 @@ class MMPluginMixin:
 
         return {"videos": results, "durations": durations}
 
+    def _silence_for_undecodable_audio(self, path: str, sampling_rate: float) -> "np.ndarray":
+        """Build the silence that stands in for an audio file we could not decode.
+
+        The length is not arbitrary: it must equal the sample count that
+        ``_get_audio_layouts`` already used to size this row's ``<|audio_pad|>``
+        run, otherwise ``masked_scatter`` fails on the GPU because the audio
+        tower emits a different number of frames than the prompt reserved
+        tokens for.  So we re-read the container metadata with the *same* PyAV
+        call and the *same* rounding as the placeholder fast path.
+
+        The two possible outcomes both stay consistent:
+
+        * Metadata readable (the usual corruption shape -- intact header, bad
+          frames).  The fast path sized the layout from this number, and we
+          return exactly that many samples.
+        * Metadata unreadable.  Then the fast path also failed and fell back to
+          decoding this row, which lands back here and gets the same constant
+          length both when the layout is computed and when features are
+          extracted -- so the two agree regardless of the value.
+        """
+        input_samples = None
+        try:
+            if not is_pyav_available():
+                raise RuntimeError("pyav is unavailable, cannot read audio metadata")
+            with av.open(path, "r") as container:
+                stream = next(candidate for candidate in container.streams if candidate.type == "audio")
+                if stream.duration is not None and stream.time_base is not None:
+                    input_samples = math.ceil(float(stream.duration * stream.time_base) * sampling_rate)
+        except Exception as error:  # noqa: BLE001 -- metadata is best-effort here
+            if is_resource_exhaustion_error(error):
+                raise
+            logger.debug(f"Could not size silence from metadata for {path}: {error}")
+
+        if not input_samples or input_samples <= 0:
+            input_samples = UNDECODABLE_AUDIO_FALLBACK_SAMPLES
+
+        return np.zeros(int(input_samples), dtype=np.float32)
+
     def _regularize_audios(
         self, audios: list["AudioInput"], sampling_rate: float, **kwargs
     ) -> "RegularizedAudioOutput":
@@ -392,7 +436,42 @@ class MMPluginMixin:
         for audio in audios:
             audio = resolve_media_path(audio)
             if not isinstance(audio, np.ndarray):
-                audio, sr = torchaudio.load(audio)
+                source_path = audio
+                try:
+                    audio, sr = torchaudio.load(audio)
+                except Exception as error:  # noqa: BLE001 -- see the comment below
+                    # A single unreadable media file used to abort the whole
+                    # job: this runs inside the collator, so the exception
+                    # killed one rank while the other ranks went on into the
+                    # next collective and eventually tripped the
+                    # monitoredBarrier, force-terminating the step.  One bad
+                    # row out of millions therefore cost the entire run (a
+                    # production 64-GPU stage died this way at 60% of epoch 0,
+                    # burning ~1,250 GPU-hours and losing everything since the
+                    # last checkpoint).
+                    #
+                    # Substituting silence keeps every rank in lockstep --
+                    # dropping the row instead would change this rank's local
+                    # batch size and hang the job on the next all_gather.  The
+                    # row still contributes a (meaningless) loss term; at this
+                    # scale that is far cheaper than losing the run, and the
+                    # WARNING below names the file so it can be repaired or
+                    # excluded afterwards.
+                    #
+                    # Resource exhaustion is deliberately NOT swallowed: an OOM
+                    # is a capacity bug, not a bad row, and masking it here
+                    # would hide it (same rule as preparation_errors.py).
+                    if is_resource_exhaustion_error(error):
+                        raise
+
+                    logger.warning(
+                        f"Undecodable audio, substituting silence: path={source_path} "
+                        f"error_class={type(error).__name__} error={error}"
+                    )
+                    results.append(self._silence_for_undecodable_audio(source_path, sampling_rate))
+                    sampling_rates.append(sampling_rate)
+                    continue
+
                 if audio.shape[0] > 1:
                     audio = audio.mean(dim=0, keepdim=True)
 
