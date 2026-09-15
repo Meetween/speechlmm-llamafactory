@@ -259,13 +259,12 @@ def load_model(
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
-    # Frozen AutoAVSR loses BN running stats on load (ZeRO-3 0-sized init / PEFT).
-    # Reload the .pth only while the encoder stays frozen so trainable lipread
-    # (LoRA or full) is not wiped. load_auto_avsr_weights is ZeRO-3-safe.
+    # AutoAVSR BN running stats are dropped under ZeRO-3 / PEFT; reload the
+    # configured .pth whenever it is set. load_auto_avsr_weights is ZeRO-3-safe.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
-    if lipread_weights and finetuning_args.freeze_lipread_encoder and hasattr(model, "load_auto_avsr_weights"):
+    if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
         model.load_auto_avsr_weights(lipread_weights)
-        logger.info_rank0(f"Restored frozen AutoAVSR lipread encoder from {lipread_weights}")
+        logger.info_rank0(f"Loaded AutoAVSR lipread encoder from {lipread_weights}")
 
     if add_valuehead:
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
