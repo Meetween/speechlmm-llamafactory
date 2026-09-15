@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from peft import PeftModel
 from transformers import DataCollatorForSeq2Seq
 
-from speechlmm.tokens import LIPREAD_FRAME_SIZE
+from speechlmm.tokens import DUMMY_LIPREAD_FRAMES, LIPREAD_FRAME_SIZE
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
@@ -170,10 +170,9 @@ def _reconcile_audio_placeholder_tokens(
         starts = [index for index, token in enumerate(input_ids) if token == audio_start_id]
         ends = [index for index, token in enumerate(input_ids) if token == audio_end_id]
         if len(starts) != audio_count or len(ends) != audio_count:
-            raise ValueError(
-                "Prepared audio spans do not match media references: "
-                f"starts={len(starts)}, ends={len(ends)}, audios={audio_count}"
-            )
+            # Dummy audio (no placeholders) or a backbone whose token ids do not
+            # match this sequence — leave the sample unchanged.
+            continue
 
         for local_index in range(audio_count - 1, -1, -1):
             start = starts[local_index]
@@ -196,6 +195,42 @@ def _reconcile_audio_placeholder_tokens(
                 if "labels" in feature:
                     feature["labels"][insertion:insertion] = [IGNORE_INDEX] * delta
         audio_offset += audio_count
+
+
+def _audio_seqlens_fallback(
+    input_ids: "torch.Tensor",
+    feature_attention_mask: "torch.Tensor | None",
+    config: Any,
+    isolate_dummy_audio: bool,
+) -> "torch.Tensor | None":
+    r"""Raw feature lengths as a last resort when placeholders cannot be counted.
+
+    Skipped under dummy-audio isolation: the dummy span carries no placeholders, so
+    the decoded feature lengths would make `get_rope_index` emit more positions than
+    `input_ids` has (610 vs 512).
+    """
+    if isolate_dummy_audio or feature_attention_mask is None:
+        return None
+    audio_token_id = getattr(config, "audio_token_id", None)
+    if audio_token_id is None or not (input_ids == audio_token_id).any():
+        return None
+    return torch.sum(feature_attention_mask, dim=-1)
+
+
+def _is_speechlmm_model(model: Any) -> bool:
+    return getattr(getattr(model, "config", None), "model_type", None) == "speechlmm"
+
+
+def _module_is_trainable(module: Any) -> bool:
+    return module is not None and any(param.requires_grad for param in module.parameters())
+
+
+def _dummy_lipread_batch() -> tuple["torch.Tensor", "torch.Tensor"]:
+    frames = DUMMY_LIPREAD_FRAMES
+    return (
+        torch.zeros((1, frames, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE)),
+        torch.ones((1, frames, frames), dtype=torch.uint8),
+    )
 
 
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
@@ -286,6 +321,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_codec_tokens.append(codec_tokens)
 
         fake_input_ids = []
+        isolate_dummy_audio = _is_speechlmm_model(self.model)
         if (
             self.template.mm_plugin.image_token is not None and sum(batch_imglens) == 0 and sum(batch_vidlens) == 0
         ):  # avoid process hanging in zero3/fsdp case
@@ -308,8 +344,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             fake_audios = [np.zeros(1600)]
             batch_audios = fake_audios
             batch_audlens[0] = 1
-            model_type = getattr(getattr(self.model, "config", None), "model_type", None)
-            if model_type != "speechlmm":
+            if not isolate_dummy_audio:
                 fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
                 fake_messages = self.template.mm_plugin.process_messages(
                     fake_messages, [], [], fake_audios, self.processor
@@ -376,11 +411,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                     self.model.config,
                 )
                 if audio_seqlens is None:
-                    feature_attention_mask = mm_inputs.get("feature_attention_mask", None)
-                    audio_token_id = getattr(self.model.config, "audio_token_id", None)
-                    has_audio_tokens = audio_token_id is not None and (features["input_ids"] == audio_token_id).any()
-                    if has_audio_tokens and feature_attention_mask is not None:
-                        audio_seqlens = torch.sum(feature_attention_mask, dim=-1)
+                    audio_seqlens = _audio_seqlens_fallback(
+                        features["input_ids"],
+                        mm_inputs.get("feature_attention_mask", None),
+                        self.model.config,
+                        isolate_dummy_audio,
+                    )
                 if audio_seqlens is not None:
                     rope_index_kwargs["audio_seqlens"] = audio_seqlens
 
@@ -452,9 +488,8 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 getattr(self.model, "lipread_encoder", None),
                 getattr(self.model, "lipread_adapter", None),
             )
-            if any(module is not None and any(param.requires_grad for param in module.parameters()) for module in lipread_modules):
-                features["lipread"] = torch.zeros((1, 16, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE))
-                features["lipread_mask"] = torch.ones((1, 16, 16), dtype=torch.uint8)
+            if any(_module_is_trainable(module) for module in lipread_modules):
+                features["lipread"], features["lipread_mask"] = _dummy_lipread_batch()
         return features
 
 

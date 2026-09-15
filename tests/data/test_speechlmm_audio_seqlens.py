@@ -4,13 +4,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from speechlmm.tokens import DUMMY_LIPREAD_FRAMES, LIPREAD_FRAME_SIZE
 
 from llamafactory.data.collator import (
+    _audio_seqlens_fallback,
+    _dummy_lipread_batch,
     _feat_extract_output_length_fn,
     _invert_feat_extract_output_length,
+    _is_speechlmm_model,
+    _module_is_trainable,
     _qwen2_5_feat_extract_output_lengths,
     _reconcile_audio_placeholder_tokens,
 )
+from llamafactory.data.template import TEMPLATES
 from llamafactory.extras.constants import IGNORE_INDEX
 
 
@@ -84,3 +90,116 @@ def test_reconcile_expands_audio_placeholders():
     )
     assert feature["input_ids"].count(11) == expected
     assert feature["labels"][feature["input_ids"].index(12) - 1] == IGNORE_INDEX
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_reconcile_skips_unmatched_audio_spans():
+    ids = [1, 10, 11, 11, 2]
+    feature = {"input_ids": ids[:], "attention_mask": [1] * 5, "labels": [IGNORE_INDEX] * 5}
+    _reconcile_audio_placeholder_tokens(
+        [feature],
+        [1],
+        {"feature_attention_mask": torch.ones(1, 1300)},
+        _qwen25_config(),
+    )
+    assert feature["input_ids"] == ids
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_reconcile_skips_when_batch_has_no_audio_tokens():
+    ids = [1, 2, 3]
+    feature = {"input_ids": ids[:], "attention_mask": [1, 1, 1], "labels": [IGNORE_INDEX] * 3}
+    _reconcile_audio_placeholder_tokens(
+        [feature],
+        [1],
+        {"feature_attention_mask": torch.ones(1, 1300)},
+        _qwen25_config(),
+    )
+    assert feature["input_ids"] == ids
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_audio_seqlens_fallback_uses_feature_lengths():
+    input_ids = torch.tensor([[10, 11, 11, 12]])
+    seqlens = _audio_seqlens_fallback(
+        input_ids,
+        torch.ones(1, 1300),
+        _qwen25_config(),
+        isolate_dummy_audio=False,
+    )
+    assert seqlens is not None
+    assert seqlens.tolist() == [1300]
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_audio_seqlens_fallback_skipped_under_dummy_isolation():
+    input_ids = torch.tensor([[10, 11, 11, 12]])
+    assert (
+        _audio_seqlens_fallback(
+            input_ids,
+            torch.ones(1, 1300),
+            _qwen25_config(),
+            isolate_dummy_audio=True,
+        )
+        is None
+    )
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_audio_seqlens_fallback_skipped_without_audio_tokens():
+    input_ids = torch.tensor([[1, 2, 3]])
+    assert (
+        _audio_seqlens_fallback(
+            input_ids,
+            torch.ones(1, 1300),
+            _qwen25_config(),
+            isolate_dummy_audio=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_audio_seqlens_fallback_skipped_without_feature_mask():
+    input_ids = torch.tensor([[10, 11, 11, 12]])
+    assert (
+        _audio_seqlens_fallback(
+            input_ids,
+            None,
+            _qwen25_config(),
+            isolate_dummy_audio=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_dummy_lipread_batch_matches_frame_constant():
+    lipread, mask = _dummy_lipread_batch()
+    assert lipread.shape == (1, DUMMY_LIPREAD_FRAMES, LIPREAD_FRAME_SIZE, LIPREAD_FRAME_SIZE)
+    assert mask.shape == (1, DUMMY_LIPREAD_FRAMES, DUMMY_LIPREAD_FRAMES)
+    assert mask.dtype == torch.uint8
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_speechlmm_model_and_trainable_helpers():
+    assert _is_speechlmm_model(SimpleNamespace(config=SimpleNamespace(model_type="speechlmm"))) is True
+    assert _is_speechlmm_model(SimpleNamespace(config=SimpleNamespace(model_type="qwen2_5_omni"))) is False
+    assert _is_speechlmm_model(None) is False
+
+    frozen = torch.nn.Linear(2, 2)
+    frozen.requires_grad_(False)
+    trainable = torch.nn.Linear(2, 2)
+    assert _module_is_trainable(None) is False
+    assert _module_is_trainable(frozen) is False
+    assert _module_is_trainable(trainable) is True
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_speechlmm_qwen2_omni_template_uses_qwen25_tokens():
+    plugin = TEMPLATES["speechlmm_qwen2_omni"].mm_plugin
+    assert plugin.image_token == "<|IMAGE|>"
+    assert plugin.video_token == "<|VIDEO|>"
+    assert plugin.audio_token == "<|AUDIO|>"
+    assert plugin.audio_bos_token == "<|audio_bos|>"
+    assert plugin.audio_eos_token == "<|audio_eos|>"

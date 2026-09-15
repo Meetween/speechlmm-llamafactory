@@ -259,12 +259,9 @@ def load_model(
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
-    # The frozen AutoAVSR lipread encoder loses its BatchNorm running stats on load: under
-    # ZeRO-3 the 0-sized init makes transformers' storage-based tied-weight detection group
-    # every lipread param/buffer, so the BN buffers get dropped by from_pretrained (speechlmm
-    # resume) or reset by PEFT (wrapper path). Reloading the pristine .pth restores them
-    # exactly (the encoder is never trained); load_auto_avsr_weights is ZeRO-3-safe
-    # (GatheredParameters). Requires lipread_encoder_weights to be set on the resume config.
+    # Frozen AutoAVSR loses BN running stats on load (ZeRO-3 0-sized init / PEFT).
+    # Reload the .pth only while the encoder stays frozen so trainable lipread
+    # (LoRA or full) is not wiped. load_auto_avsr_weights is ZeRO-3-safe.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
     if lipread_weights and finetuning_args.freeze_lipread_encoder and hasattr(model, "load_auto_avsr_weights"):
         model.load_auto_avsr_weights(lipread_weights)
