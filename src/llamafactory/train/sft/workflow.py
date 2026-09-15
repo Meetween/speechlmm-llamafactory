@@ -28,7 +28,7 @@ from speechlmm.data_loading_optimization.integration import (
 )
 from speechlmm.data_loading_optimization.limits import apply_model_derived_preparation_limits
 from speechlmm.memory_estimation.probing import configure_memory_probe, get_memory_probe, record_memory
-from speechlmm.tokens import build_speechlmm_special_tokens
+from speechlmm.tokens import build_speechlmm_special_tokens, is_speechlmm_template
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
@@ -60,7 +60,7 @@ def run_sft(
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
     needs_lipread_tokens = model_args.use_speechlmm_wrapper or (
-        data_args.template == "speechlmm"
+        is_speechlmm_template(data_args.template)
         and (not finetuning_args.freeze_lipread_encoder or not finetuning_args.freeze_lipread_adapter)
     )
     if needs_lipread_tokens:

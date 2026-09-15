@@ -2013,6 +2013,37 @@ register_template(
 )
 
 
+# Qwen2.5-Omni counterpart of "speechlmm": byte-identical to "qwen2_omni" except
+# for the plugin, so lipread data and audio data can share one prepared corpus.
+# Qwen2.5-Omni names its multimodal tokens <|AUDIO|>/<|IMAGE|>/<|VIDEO|> and
+# <|audio_bos|>/<|vision_bos|>; the Qwen3 names used by "speechlmm" are absent
+# from its vocabulary and would tokenize as plain text.
+register_template(
+    name="speechlmm_qwen2_omni",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="qwen"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="qwen"),
+    default_system="You are a helpful assistant.",
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin(
+        name="speechlmm",
+        image_token="<|IMAGE|>",
+        video_token="<|VIDEO|>",
+        audio_token="<|AUDIO|>",
+        vision_bos_token="<|vision_bos|>",
+        vision_eos_token="<|vision_eos|>",
+        audio_bos_token="<|audio_bos|>",
+        audio_eos_token="<|audio_eos|>",
+    ),
+)
+
+
 register_template(
     name="speechlmm",
     format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),

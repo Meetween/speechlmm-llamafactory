@@ -133,15 +133,21 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
         _set_z3_leaf_modules(model, [Qwen3VLMoeTextSparseMoeBlock])
 
     if model_type in ("qwen3_omni_moe", "qwen3_omni_moe_thinker", "speechlmm"):
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeThinkerTextSparseMoeBlock,
-        )
+        # A SpeechLMM wrapper may sit on a dense backbone (Qwen2.5-Omni), which
+        # has no sparse MoE block at all; DeepSpeed fails closed when asked to
+        # mark a module type the model does not contain.
+        thinker_config = getattr(model.config, "thinker_config", None)
+        text_config = getattr(thinker_config, "text_config", None)
+        if getattr(text_config, "num_experts", None):
+            from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+                Qwen3OmniMoeThinkerTextSparseMoeBlock,
+            )
 
-        # Only MoE sparse blocks need Z3 leaf treatment (routing requires all
-        # expert weights gathered).  Do NOT mark audio encoder modules as Z3
-        # leaves — they are standard transformer layers and making them leaves
-        # prevents gradients from flowing to any trainable params inside.
-        _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
+            # Only MoE sparse blocks need Z3 leaf treatment (routing requires all
+            # expert weights gathered).  Do NOT mark audio encoder modules as Z3
+            # leaves — they are standard transformer layers and making them leaves
+            # prevents gradients from flowing to any trainable params inside.
+            _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
 
 
 def configure_moe(config: "PretrainedConfig", model_args: "ModelArguments", is_trainable: bool) -> None:

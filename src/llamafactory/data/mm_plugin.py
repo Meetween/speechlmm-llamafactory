@@ -106,6 +106,12 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+# Length of the silence substituted for an audio file that fails to decode and
+# whose container metadata is also unreadable (1 second at 16 kHz).  Only the
+# consistency of this value matters, not the value itself -- see
+# MMPluginMixin._silence_for_undecodable_audio.
+UNDECODABLE_AUDIO_FALLBACK_SAMPLES = 16000
+
 
 @dataclass(frozen=True)
 class AudioTokenLayout:
@@ -194,6 +200,27 @@ def _make_batched_images(images: list["ImageObject"], imglens: list[int]) -> lis
         images = images[imglen:]
 
     return batch_images
+
+
+MEDIA_ROOT_ENV = "SPEECHLMM_MEDIA_ROOT"
+
+
+def resolve_media_path(media):
+    """Resolve a relative media path against ``$SPEECHLMM_MEDIA_ROOT``.
+
+    Preparation records media paths relative to the corpus root. A merged
+    prepared bundle rewrote them to absolute paths while merging Arrow, but a
+    linked (hardlinked) view keeps the rows exactly as prepared, so the runtime
+    has to supply the root; the trainer exports it from ``data_args.media_dir``.
+    Absolute paths and non-path inputs (arrays, PIL images, bytes, file objects)
+    pass through untouched.
+    """
+    if not isinstance(media, str):
+        return media
+    root = os.environ.get(MEDIA_ROOT_ENV, "")
+    if not root or os.path.isabs(media):
+        return media
+    return os.path.join(root, media)
 
 
 def _check_video_is_nested_images(video: "VideoInput") -> bool:
@@ -313,6 +340,7 @@ class MMPluginMixin:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
         results = []
         for image in images:
+            image = resolve_media_path(image)
             if isinstance(image, (str, BinaryIO)):
                 image = Image.open(image)
             elif isinstance(image, bytes):
@@ -335,6 +363,7 @@ class MMPluginMixin:
         results = []
         durations = []
         for video in videos:
+            video = resolve_media_path(video)
             frames: list[ImageObject] = []
             if _check_video_is_nested_images(video):
                 for frame in video:
@@ -361,14 +390,88 @@ class MMPluginMixin:
 
         return {"videos": results, "durations": durations}
 
+    def _silence_for_undecodable_audio(self, path: str, sampling_rate: float) -> "np.ndarray":
+        """Build the silence that stands in for an audio file we could not decode.
+
+        The length is not arbitrary: it must equal the sample count that
+        ``_get_audio_layouts`` already used to size this row's ``<|audio_pad|>``
+        run, otherwise ``masked_scatter`` fails on the GPU because the audio
+        tower emits a different number of frames than the prompt reserved
+        tokens for.  So we re-read the container metadata with the *same* PyAV
+        call and the *same* rounding as the placeholder fast path.
+
+        The two possible outcomes both stay consistent:
+
+        * Metadata readable (the usual corruption shape -- intact header, bad
+          frames).  The fast path sized the layout from this number, and we
+          return exactly that many samples.
+        * Metadata unreadable.  Then the fast path also failed and fell back to
+          decoding this row, which lands back here and gets the same constant
+          length both when the layout is computed and when features are
+          extracted -- so the two agree regardless of the value.
+        """
+        input_samples = None
+        try:
+            if not is_pyav_available():
+                raise RuntimeError("pyav is unavailable, cannot read audio metadata")
+            with av.open(path, "r") as container:
+                stream = next(candidate for candidate in container.streams if candidate.type == "audio")
+                if stream.duration is not None and stream.time_base is not None:
+                    input_samples = math.ceil(float(stream.duration * stream.time_base) * sampling_rate)
+        except Exception as error:  # noqa: BLE001 -- metadata is best-effort here
+            if is_resource_exhaustion_error(error):
+                raise
+            logger.debug(f"Could not size silence from metadata for {path}: {error}")
+
+        if not input_samples or input_samples <= 0:
+            input_samples = UNDECODABLE_AUDIO_FALLBACK_SAMPLES
+
+        return np.zeros(int(input_samples), dtype=np.float32)
+
     def _regularize_audios(
         self, audios: list["AudioInput"], sampling_rate: float, **kwargs
     ) -> "RegularizedAudioOutput":
         r"""Regularizes audios to avoid error. Including reading and resampling."""
         results, sampling_rates = [], []
         for audio in audios:
+            audio = resolve_media_path(audio)
             if not isinstance(audio, np.ndarray):
-                audio, sr = torchaudio.load(audio)
+                source_path = audio
+                try:
+                    audio, sr = torchaudio.load(audio)
+                except Exception as error:  # noqa: BLE001 -- see the comment below
+                    # A single unreadable media file used to abort the whole
+                    # job: this runs inside the collator, so the exception
+                    # killed one rank while the other ranks went on into the
+                    # next collective and eventually tripped the
+                    # monitoredBarrier, force-terminating the step.  One bad
+                    # row out of millions therefore cost the entire run (a
+                    # production 64-GPU stage died this way at 60% of epoch 0,
+                    # burning ~1,250 GPU-hours and losing everything since the
+                    # last checkpoint).
+                    #
+                    # Substituting silence keeps every rank in lockstep --
+                    # dropping the row instead would change this rank's local
+                    # batch size and hang the job on the next all_gather.  The
+                    # row still contributes a (meaningless) loss term; at this
+                    # scale that is far cheaper than losing the run, and the
+                    # WARNING below names the file so it can be repaired or
+                    # excluded afterwards.
+                    #
+                    # Resource exhaustion is deliberately NOT swallowed: an OOM
+                    # is a capacity bug, not a bad row, and masking it here
+                    # would hide it (same rule as preparation_errors.py).
+                    if is_resource_exhaustion_error(error):
+                        raise
+
+                    logger.warning(
+                        f"Undecodable audio, substituting silence: path={source_path} "
+                        f"error_class={type(error).__name__} error={error}"
+                    )
+                    results.append(self._silence_for_undecodable_audio(source_path, sampling_rate))
+                    sampling_rates.append(sampling_rate)
+                    continue
+
                 if audio.shape[0] > 1:
                     audio = audio.mean(dim=0, keepdim=True)
 
@@ -1796,6 +1899,7 @@ class Qwen2VLPlugin(BasePlugin):
     def _regularize_videos(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
         results, fps_per_video, durations = [], [], []
         for video in videos:
+            video = resolve_media_path(video)
             frames: list[ImageObject] = []
             if _check_video_is_nested_images(video):
                 for frame in video:
@@ -2221,6 +2325,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
         fallback_indices: list[int] = []
 
         for index, audio in enumerate(audios):
+            audio = resolve_media_path(audio)
             input_samples = None
             if isinstance(audio, np.ndarray):
                 input_samples = int(audio.shape[-1])
@@ -2477,10 +2582,51 @@ class LipreadProcessor:
         from torchcodec.samplers import clips_at_regular_timestamps
         from torchcodec.transforms import Resize
 
+        video_path = resolve_media_path(video_path)
         video_dec = VideoDecoder(video_path, transforms=[Resize((self.H, self.W))])
         video = clips_at_regular_timestamps(video_dec, seconds_between_clip_starts=1 / LIPREAD_FPS)
         video = self._get_transforms()(video.data)  # [t, b, 1, H, W]
         return video[:, 0, :, :]
+
+    def count_frames(self, video_path) -> int:
+        """Return ``__call__(video_path).shape[0]`` without decoding any frame.
+
+        Placeholder expansion needs only the frame count: the pixels are
+        discarded and decoded again by the collator at training time. That count
+        is ``len(clip_start_seconds)`` in ``clips_at_regular_timestamps``, which
+        depends solely on the decoder's stream bounds, so it can be read off the
+        metadata. Sampling instead costs one seek per output frame, and these
+        lip crops carry one keyframe for the whole file, so every seek
+        re-decodes from the start.
+        """
+        from torchcodec.decoders import VideoDecoder
+
+        # No Resize here: transforms cannot move the stream bounds, and the
+        # bounds must come from the same decoder the sampler would build.
+        decoder = VideoDecoder(resolve_media_path(video_path))
+        metadata = decoder.metadata
+        begin = metadata.begin_stream_seconds
+        end = metadata.end_stream_seconds
+        if (
+            len(decoder) < 1
+            or metadata.average_fps is None
+            or end is None
+            or begin is None
+            or begin >= end
+        ):
+            # The sampler rejects these; let it raise its own error rather than
+            # inventing one, and keep this path a pure optimization.
+            return int(self(video_path).shape[0])
+
+        # Mirrors _generic_time_based_sampler with num_frames_per_clip=1:
+        # sampling_range_start is begin_stream_seconds, sampling_range_end is
+        # end_stream_seconds, and every clip contributes exactly one frame.
+        # Use torch.arange rather than a closed-form ceil so the float rounding
+        # matches the sampler exactly, including its trailing-value guard.
+        clip_starts = torch.arange(begin, end, 1 / LIPREAD_FPS)
+        if clip_starts[-1] >= end:
+            clip_starts = clip_starts[clip_starts < end]
+        return int(clip_starts.numel())
 
 
 @dataclass
@@ -2568,12 +2714,14 @@ class SpeechLMMPlugin(Qwen2OmniPlugin):
         lipread_layouts: list[LipreadTokenLayout] = []
         if lipread:
             self._validate_input(processor, images, videos, input_audios, lipread=lipread)
-            mm_inputs = self._get_mm_inputs(images, videos, input_audios, processor, lipread=lipread)
+            # Only the frame counts are needed to size the placeholder spans, so
+            # stay off the decode path that _get_mm_inputs would take.
+            lipread_frames = [self.lipread_processor.count_frames(video) for video in lipread]
             num_lipread_tokens = 0
             for message in messages:
                 content = message["content"]
                 while LIPREAD_PLACEHOLDER in content:
-                    video_len = int(mm_inputs["lipread"][num_lipread_tokens].shape[0])
+                    video_len = lipread_frames[num_lipread_tokens]
                     # bos + pads + eos are all Thinker tokens for lipread spans
                     thinker_tokens = video_len + 2
                     lipread_layouts.append(

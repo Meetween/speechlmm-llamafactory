@@ -71,6 +71,17 @@ def _resolve_stage_base_delta(path: str) -> Path:
     return resolved
 
 
+def split_stage_base_deltas(value: str) -> list[str]:
+    """Split a stage_base_delta value that may name several deltas.
+
+    A stage can inherit the published modules of more than one earlier stage —
+    for example an end-to-end stage continuing from an independently trained
+    lipread adapter and audio adapter. Each entry is applied in order and the
+    entries must not touch the same parameter.
+    """
+    return [entry.strip() for entry in str(value).split(",") if entry.strip()]
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -86,13 +97,32 @@ def _canonical_parameter_name(name: str) -> str:
 
 
 def load_stage_base_delta(model: torch.nn.Module, path: str) -> None:
-    """Overlay a strict full-weight delta before PEFT/LoRA construction."""
+    """Overlay strict full-weight deltas before PEFT/LoRA construction.
+
+    ``path`` may name several deltas, comma separated; they are merged and must
+    not overlap, so inheriting two independent adapter stages is unambiguous.
+    """
     from safetensors.torch import load_file
 
-    delta_path = _resolve_stage_base_delta(path)
-    state = dict(load_file(str(delta_path), device="cpu"))
-    if not state:
-        raise ValueError(f"Stage base delta is empty: {delta_path}")
+    entries = split_stage_base_deltas(path)
+    if not entries:
+        raise ValueError(f"stage_base_delta is empty: {path!r}")
+    delta_paths = [_resolve_stage_base_delta(entry) for entry in entries]
+
+    state: dict[str, "torch.Tensor"] = {}
+    provenance: dict[str, str] = {}
+    for delta_path in delta_paths:
+        loaded = dict(load_file(str(delta_path), device="cpu"))
+        if not loaded:
+            raise ValueError(f"Stage base delta is empty: {delta_path}")
+        collisions = sorted(set(loaded) & set(state))
+        if collisions:
+            raise ValueError(
+                f"Stage base deltas overlap on {collisions[:10]}: "
+                f"{provenance[collisions[0]]} and {delta_path}"
+            )
+        state.update(loaded)
+        provenance.update({key: str(delta_path) for key in loaded})
     if any("lora_" in key for key in state):
         raise ValueError("stage_base_delta must contain full weights, not LoRA tensors")
 
@@ -139,11 +169,14 @@ def load_stage_base_delta(model: torch.nn.Module, path: str) -> None:
             parameter.data.copy_(state[key].to(device=parameter.device, dtype=parameter.dtype))
 
     model._speechlmm_stage_base_delta = {
-        "path": str(delta_path.resolve()),
-        "sha256": _file_sha256(delta_path),
+        "paths": [str(delta_path.resolve()) for delta_path in delta_paths],
+        "sha256": [_file_sha256(delta_path) for delta_path in delta_paths],
         "keys": sorted(state),
     }
-    logger.info_rank0(f"Loaded {len(state)} Stage-1 full-weight tensors from {delta_path}")
+    logger.info_rank0(
+        f"Loaded {len(state)} inherited full-weight tensors from "
+        + ", ".join(str(delta_path) for delta_path in delta_paths)
+    )
 
 
 @contextmanager
@@ -325,7 +358,7 @@ def load_model(
             if lipread_encoder_weights is not None:
                 config_overrides["lipread_encoder_weights"] = lipread_encoder_weights
 
-            speechlmm_config = SpeechLMMConfig.from_qwen3_omni_config(config, **config_overrides)
+            speechlmm_config = SpeechLMMConfig.from_qwen_omni_config(config, **config_overrides)
             if (
                 getattr(config, "model_type", None) == "qwen3_omni_moe"
                 and finetuning_args.freeze_talker
@@ -349,9 +382,33 @@ def load_model(
                 thinker_kwargs["config"] = thinker_config
                 with _disable_zero3_pointer_tie_inference(Qwen3OmniMoeThinkerForConditionalGeneration):
                     qwen3_model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(**thinker_kwargs)
+            elif (
+                getattr(config, "model_type", None) == "qwen2_5_omni"
+                and finetuning_args.freeze_talker
+                and finetuning_args.freeze_code2wav
+            ):
+                # Same reasoning as the Qwen3-Omni branch above: load only the
+                # Thinker so the frozen Talker and Token2Wav weights are never
+                # materialized, which matters most under ZeRO-3.
+                from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+                    Qwen2_5OmniThinkerForConditionalGeneration,
+                )
+
+                thinker_kwargs = dict(init_kwargs)
+                thinker_config = config.thinker_config
+                thinker_config.tie_word_embeddings = bool(
+                    getattr(thinker_config.text_config, "tie_word_embeddings", False)
+                )
+                thinker_kwargs["config"] = thinker_config
+                with _disable_zero3_pointer_tie_inference(
+                    Qwen2_5OmniThinkerForConditionalGeneration
+                ):
+                    qwen3_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+                        **thinker_kwargs
+                    )
             else:
                 qwen3_model = AutoModelForTextToWaveform.from_pretrained(**init_kwargs)
-            model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(qwen3_model, speechlmm_config)
+            model = SpeechLMMForConditionalGeneration._wrap_qwen_omni(qwen3_model, speechlmm_config)
             if lipread_encoder_weights is not None:
                 model.load_auto_avsr_weights(lipread_encoder_weights)
         else:
