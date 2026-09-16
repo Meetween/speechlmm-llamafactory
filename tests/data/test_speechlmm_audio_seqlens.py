@@ -93,16 +93,29 @@ def test_reconcile_expands_audio_placeholders():
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
-def test_reconcile_skips_unmatched_audio_spans():
-    ids = [1, 10, 11, 11, 2]
-    feature = {"input_ids": ids[:], "attention_mask": [1] * 5, "labels": [IGNORE_INDEX] * 5}
+def test_reconcile_skips_dummy_audio_without_placeholders():
+    ids = [1, 2, 3]
+    feature = {"input_ids": ids[:], "attention_mask": [1] * 3, "labels": [IGNORE_INDEX] * 3}
     _reconcile_audio_placeholder_tokens(
         [feature],
         [1],
         {"feature_attention_mask": torch.ones(1, 1300)},
-        _qwen25_config(),
+        _qwen25_config(audio_token_id=3),
     )
     assert feature["input_ids"] == ids
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_reconcile_raises_on_truncated_audio_span():
+    ids = [1, 10, 11, 11]
+    feature = {"input_ids": ids[:], "attention_mask": [1] * 4, "labels": [IGNORE_INDEX] * 4}
+    with pytest.raises(ValueError, match="cutoff_len"):
+        _reconcile_audio_placeholder_tokens(
+            [feature],
+            [1],
+            {"feature_attention_mask": torch.ones(1, 1300)},
+            _qwen25_config(),
+        )
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
@@ -125,21 +138,21 @@ def test_audio_seqlens_fallback_uses_feature_lengths():
         input_ids,
         torch.ones(1, 1300),
         _qwen25_config(),
-        isolate_dummy_audio=False,
+        is_speechlmm=False,
     )
     assert seqlens is not None
     assert seqlens.tolist() == [1300]
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
-def test_audio_seqlens_fallback_skipped_under_dummy_isolation():
+def test_audio_seqlens_fallback_skipped_for_speechlmm():
     input_ids = torch.tensor([[10, 11, 11, 12]])
     assert (
         _audio_seqlens_fallback(
             input_ids,
             torch.ones(1, 1300),
             _qwen25_config(),
-            isolate_dummy_audio=True,
+            is_speechlmm=True,
         )
         is None
     )
@@ -153,7 +166,7 @@ def test_audio_seqlens_fallback_skipped_without_audio_tokens():
             input_ids,
             torch.ones(1, 1300),
             _qwen25_config(),
-            isolate_dummy_audio=False,
+            is_speechlmm=False,
         )
         is None
     )
@@ -167,7 +180,7 @@ def test_audio_seqlens_fallback_skipped_without_feature_mask():
             input_ids,
             None,
             _qwen25_config(),
-            isolate_dummy_audio=False,
+            is_speechlmm=False,
         )
         is None
     )
