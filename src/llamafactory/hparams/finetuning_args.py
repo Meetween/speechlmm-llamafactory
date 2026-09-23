@@ -539,6 +539,10 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},
     )
+    use_stateful_dataloader: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to checkpoint and restore the exact training dataloader position."},
+    )
     early_stopping_steps: int | None = field(
         default=None,
         metadata={"help": "Number of steps to stop training if the `metric_for_best_model` does not improve."},

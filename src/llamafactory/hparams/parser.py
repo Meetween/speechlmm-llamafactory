@@ -462,6 +462,17 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             logger.info_rank0(f"Resuming training from {training_args.resume_from_checkpoint}.")
             logger.info_rank0("Change `output_dir` or use `overwrite_output_dir` to avoid.")
 
+    if finetuning_args.use_stateful_dataloader and not training_args.ignore_data_skip:
+        logger.info_rank0(
+            "Set `ignore_data_skip` to True since the dataloader position is restored from the checkpoint."
+        )
+        training_args.ignore_data_skip = True
+
+    if finetuning_args.use_stateful_dataloader and data_args.streaming:
+        logger.warning_rank0(
+            "`use_stateful_dataloader` with `streaming: true` uses the untested DataLoaderDispatcher path."
+        )
+
     if (
         finetuning_args.stage in ["rm", "ppo"]
         and finetuning_args.finetuning_type == "lora"

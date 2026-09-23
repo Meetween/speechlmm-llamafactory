@@ -23,12 +23,19 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import numpy as np
 import torch
 from transformers import Seq2SeqTrainer
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from typing_extensions import override
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
+from ..stateful_dataloader import (
+    enable_stateful_dataloader,
+    load_dataloader_state,
+    save_dataloader_state,
+    tolerate_worker_state_snapshot,
+)
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
@@ -120,6 +127,39 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
         return super()._get_train_sampler(*args, **kwargs)
+
+    @override
+    def _inner_training_loop(self, *args, **kwargs):
+        self._dataloader_resume_path = kwargs.get("resume_from_checkpoint")
+        return super()._inner_training_loop(*args, **kwargs)
+
+    @override
+    def get_train_dataloader(self):
+        if not self.finetuning_args.use_stateful_dataloader or not enable_stateful_dataloader(self.accelerator):
+            return super().get_train_dataloader()
+
+        try:
+            dataloader = super().get_train_dataloader()
+        finally:
+            self.accelerator.dataloader_config.use_stateful_dataloader = False
+
+        if not getattr(dataloader, "use_stateful_dataloader", False):
+            raise RuntimeError(
+                "`use_stateful_dataloader` is set but the prepared training dataloader is not stateful."
+            )
+
+        tolerate_worker_state_snapshot(dataloader)
+        self._train_dataloader = dataloader
+        if getattr(self, "_dataloader_resume_path", None) is not None:
+            load_dataloader_state(self, dataloader, self._dataloader_resume_path)
+        return dataloader
+
+    @override
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        if getattr(self, "_train_dataloader", None) is not None:
+            output_dir = os.path.join(self._get_output_dir(trial), f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
+            save_dataloader_state(self, self._train_dataloader, output_dir)
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
