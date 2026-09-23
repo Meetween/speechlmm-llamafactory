@@ -172,7 +172,20 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
         # Skip when the class is absent (dense SpeechLMM Qwen2.5); DeepSpeed
         # raises if we register a leaf type that is not in the module tree.
         if any(isinstance(module, Qwen3OmniMoeThinkerTextSparseMoeBlock) for module in model.modules()):
-            _set_z3_leaf_modules(model, [Qwen3OmniMoeThinkerTextSparseMoeBlock])
+            leaf_types = [Qwen3OmniMoeThinkerTextSparseMoeBlock]
+            talker = getattr(model, "talker", None)
+            if talker is not None and any(param.requires_grad for param in talker.parameters()):
+                try:
+                    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+                        Qwen3OmniMoeTalkerTextSparseMoeBlock,
+                    )
+                except ImportError:
+                    Qwen3OmniMoeTalkerTextSparseMoeBlock = None
+                if Qwen3OmniMoeTalkerTextSparseMoeBlock is not None and any(
+                    isinstance(module, Qwen3OmniMoeTalkerTextSparseMoeBlock) for module in talker.modules()
+                ):
+                    leaf_types.append(Qwen3OmniMoeTalkerTextSparseMoeBlock)
+            _set_z3_leaf_modules(model, leaf_types)
 
 
 def configure_moe(config: "PretrainedConfig", model_args: "ModelArguments", is_trainable: bool) -> None:

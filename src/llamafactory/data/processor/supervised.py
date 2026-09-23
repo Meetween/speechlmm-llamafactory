@@ -124,7 +124,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["audios"].append(examples["_audios"][i])
             model_inputs["lipread"].append(examples["_lipread"][i])
             codec_tokens = examples.get("_codec_tokens", [None] * len(examples["_prompt"]))
+            speakers = examples.get("_speaker", [None] * len(examples["_prompt"]))
             model_inputs["codec_tokens"].append(codec_tokens[i])
+            model_inputs["speaker"].append(speakers[i])
 
         return model_inputs
 

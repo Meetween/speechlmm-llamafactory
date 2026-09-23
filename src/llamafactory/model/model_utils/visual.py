@@ -337,9 +337,19 @@ def build_component_lora_targets(
             )
         )
 
-    # TODO: add lora_talker block (composite.talker_keys, exclude code_predictor heads?)
-    # TODO: add lora_vision_encoder block (composite.vision_model_keys)
-    # TODO(low-priority): add lora_code2wav block (composite.code2wav_keys)
+    if getattr(finetuning_args, "lora_talker", False):
+        exclude = []
+        if getattr(finetuning_args, "freeze_code_predictor", True):
+            exclude.append("talker.code_predictor")
+        components.append(
+            (
+                "talker",
+                finetuning_args.lora_talker_rank,
+                finetuning_args.lora_talker_alpha,
+                composite.talker_keys,
+                exclude,
+            )
+        )
 
     target_modules: list[str] = []
     rank_pattern: dict[str, int] = {}

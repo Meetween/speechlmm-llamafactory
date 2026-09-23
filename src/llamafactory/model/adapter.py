@@ -245,13 +245,14 @@ def _setup_lora_tuning(
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
-        # TODO: extend when adding lora_talker, lora_vision_encoder, lora_code2wav
+        # TODO: extend when adding lora_vision_encoder, lora_code2wav
         _component_flags = (
             "lora_audio_encoder",
             "lora_audio_adapters",
             "lora_language_model",
             "lora_lipread_encoder",
             "lora_lipread_adapter",
+            "lora_talker",
         )
         has_component_lora = any(getattr(finetuning_args, f, False) for f in _component_flags)
 

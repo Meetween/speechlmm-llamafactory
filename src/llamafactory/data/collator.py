@@ -25,6 +25,7 @@ from peft import PeftModel
 from transformers import DataCollatorForSeq2Seq
 
 from speechlmm.tokens import DUMMY_LIPREAD_FRAMES, LIPREAD_FRAME_SIZE
+from speechlmm.models.talker_loss import pad_codec_batch
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
@@ -232,6 +233,20 @@ def _module_is_trainable(module: Any) -> bool:
     return module is not None and any(param.requires_grad for param in module.parameters())
 
 
+def _talker_is_trainable(model: Any) -> bool:
+    return _module_is_trainable(getattr(model, "talker", None))
+
+
+def _resolve_collated_speaker_id(model: Any, name: str | None) -> int:
+    config = getattr(model, "config", None)
+    if config is None:
+        raise ValueError("Cannot resolve talker speaker without a model config")
+    resolve = getattr(config, "resolve_talker_speaker_id", None)
+    if resolve is None:
+        raise ValueError("SpeechLMM config is missing resolve_talker_speaker_id")
+    return int(resolve(name, getattr(model, "speaker_map", None)))
+
+
 def _dummy_lipread_batch() -> tuple["torch.Tensor", "torch.Tensor"]:
     frames = DUMMY_LIPREAD_FRAMES
     return (
@@ -310,13 +325,15 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios, batch_lipread = [], [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
-        batch_codec_tokens: list[list[int] | None] = []
+        batch_codec_tokens: list = []
+        batch_speakers: list = []
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
             lipread = feature.pop("lipread", None) or []
             codec_tokens = feature.pop("codec_tokens", None)
+            speaker = feature.pop("speaker", None)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
@@ -326,6 +343,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_audlens.append(len(audios))
             batch_input_ids.append(feature["input_ids"])
             batch_codec_tokens.append(codec_tokens)
+            batch_speakers.append(speaker)
 
         fake_input_ids = []
         is_speechlmm = _is_speechlmm_model(self.model)
@@ -466,16 +484,24 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
             return {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
 
-        has_codec = any(ct is not None for ct in batch_codec_tokens)
-        if has_codec:
-            max_codec_len = max(len(ct) for ct in batch_codec_tokens if ct is not None)
-            padded_codec = []
-            for ct in batch_codec_tokens:
-                if ct is None:
-                    padded_codec.append([IGNORE_INDEX] * max_codec_len)
-                else:
-                    padded_codec.append(ct + [IGNORE_INDEX] * (max_codec_len - len(ct)))
-            features["codec_labels"] = torch.tensor(padded_codec, dtype=torch.long)
+        has_codec = any(ct is not None and len(ct) > 0 for ct in batch_codec_tokens)
+        talker_trainable = is_speechlmm and _talker_is_trainable(self.model)
+        num_codebooks = getattr(getattr(self.model, "config", None), "talker_num_codebooks", None)
+        if has_codec or talker_trainable:
+            labels, codec_mask = pad_codec_batch(
+                batch_codec_tokens,
+                num_codebooks=num_codebooks,
+                ignore_index=IGNORE_INDEX,
+                dummy=talker_trainable and not has_codec,
+            )
+            if labels is not None:
+                features["codec_labels"] = labels
+                features["codec_mask"] = codec_mask
+                if is_speechlmm and self.model is not None:
+                    features["talker_speaker_ids"] = torch.tensor(
+                        [_resolve_collated_speaker_id(self.model, name) for name in batch_speakers],
+                        dtype=torch.long,
+                    )
 
         if len(batch_lipread) > 0:
             lipread = features["lipread"]

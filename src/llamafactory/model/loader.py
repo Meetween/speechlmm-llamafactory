@@ -213,6 +213,11 @@ def load_model(
                 config_overrides["lipread_encoder_weights"] = lipread_encoder_weights
 
             model_type = getattr(config, "model_type", None)
+            if not finetuning_args.freeze_talker:
+                config_overrides["enable_talker"] = True
+                if model_type == "qwen2_5_omni":
+                    config_overrides["enable_code2wav"] = False
+
             if model_type == "qwen2_5_omni":
                 speechlmm_config = SpeechLMMConfig.from_qwen2_5_omni_config(
                     config, **config_overrides
@@ -231,6 +236,19 @@ def load_model(
                 )
             if lipread_encoder_weights is not None:
                 model.load_auto_avsr_weights(lipread_encoder_weights)
+            if hasattr(model, "load_speakers"):
+                from pathlib import Path
+
+                spk_path = Path(str(model_args.model_name_or_path)) / "spk_dict.pt"
+                if not getattr(model, "speaker_map", None) and spk_path.is_file():
+                    model.load_speakers(str(spk_path))
+                elif getattr(model, "speaker_map", None):
+                    try:
+                        model.config.speaker_bos_token_id = model.config.resolve_talker_speaker_id(
+                            model.config.talker_speaker, model.speaker_map
+                        )
+                    except ValueError:
+                        pass
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
@@ -256,6 +274,7 @@ def load_model(
         register_autoclass(config, model, tokenizer)
         if getattr(model.config, "model_type", None) == "speechlmm":
             SpeechLMMConfig.sync_lipread_token_ids_from_tokenizer(model.config, tokenizer)
+            SpeechLMMConfig.sync_talker_token_ids_from_tokenizer(model.config, tokenizer)
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 

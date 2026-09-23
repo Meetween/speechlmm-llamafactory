@@ -40,6 +40,13 @@ class DatasetConverter:
     dataset_attr: "DatasetAttr"
     data_args: "DataArguments"
 
+    def _codec_and_speaker(self, example: dict[str, Any]) -> tuple[Any, Any]:
+        codec_key = self.dataset_attr.codec_tokens or "codec_tokens"
+        speaker_key = self.dataset_attr.speaker or "speaker"
+        codec = example.get(codec_key) if codec_key in example or self.dataset_attr.codec_tokens else None
+        speaker = example.get(speaker_key) if speaker_key in example or self.dataset_attr.speaker else None
+        return codec, speaker
+
     def _find_medias(self, medias: Union["MediaType", list["MediaType"], None]) -> list["MediaType"] | None:
         r"""Optionally concatenate media path to media dir when loading from local disk."""
         if medias is None:
@@ -129,6 +136,7 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
             "_lipread": self._find_medias(example[self.dataset_attr.lipread]) if self.dataset_attr.lipread else None,
             "_codec_tokens": example[self.dataset_attr.codec_tokens] if self.dataset_attr.codec_tokens else None,
+            "_speaker": example.get(self.dataset_attr.speaker or "speaker"),
         }
         return output
 
@@ -227,6 +235,7 @@ class SharegptDatasetConverter(DatasetConverter):
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
             "_lipread": self._find_medias(example[self.dataset_attr.lipread]) if self.dataset_attr.lipread else None,
             "_codec_tokens": example[self.dataset_attr.codec_tokens] if self.dataset_attr.codec_tokens else None,
+            "_speaker": example.get(self.dataset_attr.speaker or "speaker"),
         }
         return output
 
@@ -369,6 +378,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
             "_lipread": self._find_medias(example[self.dataset_attr.lipread]) if self.dataset_attr.lipread else None,
             "_codec_tokens": example[self.dataset_attr.codec_tokens] if self.dataset_attr.codec_tokens else None,
+            "_speaker": example.get(self.dataset_attr.speaker or "speaker"),
         }
         return output
 
