@@ -1,4 +1,4 @@
-# Copyright 2025 HuggingFace Inc. and the LlamaFactory team.
+# Copyright 2025 the LlamaFactory team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ from ..extras import logging
 if TYPE_CHECKING:
     from accelerate import Accelerator
     from torch.utils.data import DataLoader
+    from transformers import Trainer
 
     from ..hparams import DataArguments
 
@@ -55,7 +56,7 @@ def data_config_fingerprint(config: dict) -> str:
 
 
 def tolerate_worker_state_snapshot(dataloader: "DataLoader") -> None:
-    """Leave a worker snapshot untouched.
+    """Skip accelerate's prefetch rewind when the state is a worker snapshot.
 
     ``DataLoaderAdapter.adjust_state_dict_for_prefetch`` always reads
     ``_sampler_iter_yielded``. torchdata only puts that key at the top level when
@@ -72,32 +73,26 @@ def tolerate_worker_state_snapshot(dataloader: "DataLoader") -> None:
     dataloader.adjust_state_dict_for_prefetch = adjust
 
 
-def enable_stateful_dataloader(accelerator: "Accelerator") -> bool:
+def enable_stateful_dataloader(accelerator: "Accelerator") -> None:
     from accelerate.utils import is_torchdata_stateful_dataloader_available
 
     if not is_torchdata_stateful_dataloader_available():
-        logger.warning_rank0(
-            "`use_stateful_dataloader` is set but torchdata StatefulDataLoader is unavailable. "
-            "The training dataloader position will not be restored."
-        )
-        return False
+        raise ImportError("`use_stateful_dataloader` requires torchdata with StatefulDataLoader.")
 
     if not hasattr(accelerator.dataloader_config, "use_stateful_dataloader"):
-        logger.warning_rank0(
-            "`use_stateful_dataloader` is set but this accelerate build has no "
-            "`DataLoaderConfiguration.use_stateful_dataloader`. The training dataloader position will not be restored."
+        raise ImportError(
+            "`use_stateful_dataloader` requires an accelerate version with "
+            "`DataLoaderConfiguration.use_stateful_dataloader`."
         )
-        return False
 
     accelerator.dataloader_config.use_stateful_dataloader = True
-    return True
 
 
 def _state_path(directory: str, process_index: int) -> str:
     return os.path.join(directory, DATALOADER_STATE_NAME.format(process_index))
 
 
-def _envelope(trainer) -> dict:
+def _envelope(trainer: "Trainer") -> dict:
     return {
         "rank": trainer.args.process_index,
         "world_size": trainer.args.world_size,
@@ -109,14 +104,7 @@ def _envelope(trainer) -> dict:
     }
 
 
-def save_dataloader_state(trainer, dataloader: "DataLoader", output_dir: str) -> None:
-    if not getattr(dataloader, "use_stateful_dataloader", False):
-        return
-
-    data_config = getattr(trainer, "_stateful_data_config", None)
-    if data_config is None:
-        raise RuntimeError("Stateful dataloader data configuration has not been initialized.")
-
+def save_dataloader_state(trainer: "Trainer", dataloader: "DataLoader", output_dir: str, data_config: dict) -> None:
     state = {
         "version": _STATE_VERSION,
         "dataloader": dataloader.state_dict(),
@@ -137,7 +125,9 @@ def _yielded_count(state: dict):
     return None
 
 
-def load_dataloader_state(trainer, dataloader: "DataLoader", checkpoint_dir: str) -> None:
+def load_dataloader_state(
+    trainer: "Trainer", dataloader: "DataLoader", checkpoint_dir: str, data_config: dict
+) -> None:
     state_file = _state_path(checkpoint_dir, trainer.args.process_index)
     if not os.path.isfile(state_file):
         raise ValueError(
@@ -156,12 +146,7 @@ def load_dataloader_state(trainer, dataloader: "DataLoader", checkpoint_dir: str
                 f"current value={value}."
             )
 
-    data_config = getattr(trainer, "_stateful_data_config", None)
-    if data_config is None:
-        raise RuntimeError("Stateful dataloader data configuration has not been initialized.")
-
-    fingerprint = data_config_fingerprint(data_config)
-    if state.get("data_fingerprint") != fingerprint:
+    if state.get("data_fingerprint") != data_config_fingerprint(data_config):
         raise ValueError(
             "Stateful dataloader checkpoint is incompatible with the current data configuration.\n"
             f"Checkpoint: {state.get('data_config')}\n"

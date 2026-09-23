@@ -39,7 +39,7 @@ class _Ids(Dataset):
         return index
 
 
-def _data_args(**overrides):
+def _data_config(**overrides) -> dict:
     values = {
         "dataset": ["toy"],
         "streaming": False,
@@ -51,10 +51,10 @@ def _data_args(**overrides):
         "neat_packing": False,
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return build_stateful_data_config(SimpleNamespace(**values))
 
 
-def _trainer(batch_size: int = 4, **data_overrides):
+def _trainer(batch_size: int = 4):
     return SimpleNamespace(
         args=SimpleNamespace(
             process_index=0,
@@ -65,7 +65,6 @@ def _trainer(batch_size: int = 4, **data_overrides):
             dataloader_drop_last=True,
         ),
         _train_batch_size=batch_size,
-        _stateful_data_config=build_stateful_data_config(_data_args(**data_overrides)),
     )
 
 
@@ -108,10 +107,10 @@ def test_round_trip_restores_the_unconsumed_tail(tmp_path, accelerator):
     for batch in reference:
         seen.append(batch.tolist())
         if len(seen) == 3:
-            save_dataloader_state(trainer, reference, str(tmp_path))
+            save_dataloader_state(trainer, reference, str(tmp_path), _data_config())
 
     restored = _loader(accelerator)
-    load_dataloader_state(trainer, restored, str(tmp_path))
+    load_dataloader_state(trainer, restored, str(tmp_path), _data_config())
     assert _batches(restored) == seen[3:]
 
 
@@ -119,28 +118,27 @@ def test_missing_state_file_raises(tmp_path, accelerator):
     trainer = _trainer()
     dataloader = _loader(accelerator)
     with pytest.raises(ValueError, match="was not found"):
-        load_dataloader_state(trainer, dataloader, str(tmp_path))
+        load_dataloader_state(trainer, dataloader, str(tmp_path), _data_config())
 
 
 def test_batch_size_mismatch_raises(tmp_path, accelerator):
     trainer = _trainer(batch_size=4)
     dataloader = _loader(accelerator)
     next(iter(dataloader))
-    save_dataloader_state(trainer, dataloader, str(tmp_path))
+    save_dataloader_state(trainer, dataloader, str(tmp_path), _data_config())
 
     trainer._train_batch_size = 8
     restored = _loader(accelerator, batch_size=8)
     with pytest.raises(ValueError, match="batch_size"):
-        load_dataloader_state(trainer, restored, str(tmp_path))
+        load_dataloader_state(trainer, restored, str(tmp_path), _data_config())
 
 
 def test_data_fingerprint_mismatch_raises(tmp_path, accelerator):
     trainer = _trainer()
     dataloader = _loader(accelerator)
     next(iter(dataloader))
-    save_dataloader_state(trainer, dataloader, str(tmp_path))
+    save_dataloader_state(trainer, dataloader, str(tmp_path), _data_config())
 
-    trainer._stateful_data_config = build_stateful_data_config(_data_args(dataset=["other"]))
     restored = _loader(accelerator)
     with pytest.raises(ValueError, match="data configuration"):
-        load_dataloader_state(trainer, restored, str(tmp_path))
+        load_dataloader_state(trainer, restored, str(tmp_path), _data_config(dataset=["other"]))

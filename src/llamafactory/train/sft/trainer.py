@@ -59,6 +59,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         processor: Optional["ProcessorMixin"],
         model_args: Optional["ModelArguments"] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
+        stateful_data_config: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
@@ -80,6 +81,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.label_names = ["labels"]
 
         self.finetuning_args = finetuning_args
+        if finetuning_args.use_stateful_dataloader and stateful_data_config is None:
+            raise ValueError("`use_stateful_dataloader` requires `stateful_data_config`.")
+
+        self._stateful_data_config = stateful_data_config
+        self._dataloader_resume_path: Optional[str] = None
+        self._stateful_train_dataloader = None
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
@@ -135,9 +142,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def get_train_dataloader(self):
-        if not self.finetuning_args.use_stateful_dataloader or not enable_stateful_dataloader(self.accelerator):
+        if not self.finetuning_args.use_stateful_dataloader:
             return super().get_train_dataloader()
 
+        enable_stateful_dataloader(self.accelerator)
         try:
             dataloader = super().get_train_dataloader()
         finally:
@@ -149,17 +157,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             )
 
         tolerate_worker_state_snapshot(dataloader)
-        self._train_dataloader = dataloader
-        if getattr(self, "_dataloader_resume_path", None) is not None:
-            load_dataloader_state(self, dataloader, self._dataloader_resume_path)
+        self._stateful_train_dataloader = dataloader
+        if self._dataloader_resume_path is not None:
+            load_dataloader_state(self, dataloader, self._dataloader_resume_path, self._stateful_data_config)
         return dataloader
 
     @override
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
-        if getattr(self, "_train_dataloader", None) is not None:
+        if self._stateful_train_dataloader is not None:
             output_dir = os.path.join(self._get_output_dir(trial), f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
-            save_dataloader_state(self, self._train_dataloader, output_dir)
+            save_dataloader_state(self, self._stateful_train_dataloader, output_dir, self._stateful_data_config)
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):

@@ -140,12 +140,13 @@ def run_sft(
             data_collator=data_collator,
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
+            stateful_data_config=(
+                build_stateful_data_config(data_args) if finetuning_args.use_stateful_dataloader else None
+            ),
             **dataset_module,
             **tokenizer_module,
             **metric_module,
         )
-        if finetuning_args.use_stateful_dataloader:
-            trainer._stateful_data_config = build_stateful_data_config(data_args)
 
     # Training
     if training_args.do_train:
