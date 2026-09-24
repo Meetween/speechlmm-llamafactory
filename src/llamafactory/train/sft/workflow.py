@@ -26,6 +26,7 @@ from ...extras.misc import calculate_tps
 from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
+from ..stateful_dataloader import build_stateful_data_config
 from ..trainer_utils import create_modelcard_and_push
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
@@ -139,6 +140,9 @@ def run_sft(
             data_collator=data_collator,
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
+            stateful_data_config=(
+                build_stateful_data_config(data_args) if finetuning_args.use_stateful_dataloader else None
+            ),
             **dataset_module,
             **tokenizer_module,
             **metric_module,

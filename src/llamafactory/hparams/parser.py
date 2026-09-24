@@ -286,6 +286,12 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         if data_args.train_on_prompt or data_args.mask_history:
             raise ValueError("`train_on_prompt` or `mask_history` cannot be set as True except SFT.")
 
+        if finetuning_args.use_stateful_dataloader:
+            raise ValueError("`use_stateful_dataloader` cannot be set as True except SFT.")
+
+    if finetuning_args.use_stateful_dataloader and model_args.use_kt:
+        raise ValueError("`use_stateful_dataloader` is not supported with KTransformers.")
+
     if finetuning_args.stage == "sft" and training_args.do_predict and not training_args.predict_with_generate:
         raise ValueError("Please enable `predict_with_generate` to save model predictions.")
 
@@ -461,6 +467,17 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             training_args.resume_from_checkpoint = last_checkpoint
             logger.info_rank0(f"Resuming training from {training_args.resume_from_checkpoint}.")
             logger.info_rank0("Change `output_dir` or use `overwrite_output_dir` to avoid.")
+
+    if finetuning_args.use_stateful_dataloader and not training_args.ignore_data_skip:
+        logger.info_rank0(
+            "Set `ignore_data_skip` to True since the dataloader position is restored from the checkpoint."
+        )
+        training_args.ignore_data_skip = True
+
+    if finetuning_args.use_stateful_dataloader and data_args.streaming:
+        logger.warning_rank0(
+            "`use_stateful_dataloader` with `streaming: true` uses the untested DataLoaderDispatcher path."
+        )
 
     if (
         finetuning_args.stage in ["rm", "ppo"]

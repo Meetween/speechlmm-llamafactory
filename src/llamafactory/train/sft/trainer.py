@@ -23,12 +23,19 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import numpy as np
 import torch
 from transformers import Seq2SeqTrainer
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from typing_extensions import override
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
+from ..stateful_dataloader import (
+    enable_stateful_dataloader,
+    load_dataloader_state,
+    save_dataloader_state,
+    tolerate_worker_state_snapshot,
+)
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
@@ -52,6 +59,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         processor: Optional["ProcessorMixin"],
         model_args: Optional["ModelArguments"] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
+        stateful_data_config: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
@@ -73,6 +81,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.label_names = ["labels"]
 
         self.finetuning_args = finetuning_args
+        if finetuning_args.use_stateful_dataloader and stateful_data_config is None:
+            raise ValueError("`use_stateful_dataloader` requires `stateful_data_config`.")
+
+        self._stateful_data_config = stateful_data_config
+        self._dataloader_resume_path: Optional[str] = None
+        self._stateful_train_dataloader = None
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
@@ -120,6 +134,40 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
         return super()._get_train_sampler(*args, **kwargs)
+
+    @override
+    def _inner_training_loop(self, *args, **kwargs):
+        self._dataloader_resume_path = kwargs.get("resume_from_checkpoint")
+        return super()._inner_training_loop(*args, **kwargs)
+
+    @override
+    def get_train_dataloader(self):
+        if not self.finetuning_args.use_stateful_dataloader:
+            return super().get_train_dataloader()
+
+        enable_stateful_dataloader(self.accelerator)
+        try:
+            dataloader = super().get_train_dataloader()
+        finally:
+            self.accelerator.dataloader_config.use_stateful_dataloader = False
+
+        if not getattr(dataloader, "use_stateful_dataloader", False):
+            raise RuntimeError(
+                "`use_stateful_dataloader` is set but the prepared training dataloader is not stateful."
+            )
+
+        tolerate_worker_state_snapshot(dataloader)
+        self._stateful_train_dataloader = dataloader
+        if self._dataloader_resume_path is not None:
+            load_dataloader_state(self, dataloader, self._dataloader_resume_path, self._stateful_data_config)
+        return dataloader
+
+    @override
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        if self._stateful_train_dataloader is not None:
+            output_dir = os.path.join(self._get_output_dir(trial), f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
+            save_dataloader_state(self, self._stateful_train_dataloader, output_dir, self._stateful_data_config)
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
