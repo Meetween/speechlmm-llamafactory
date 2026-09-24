@@ -189,11 +189,15 @@ def patch_config(
         setattr(config, "init_tts", False)
 
     if getattr(config, "model_type", None) == "qwen2_5_omni" and is_trainable:
-        # token2wav/BigVGAN filter init is not ZeRO-3 safe (CPU vs CUDA). Training uses thinker
-        # only; loader.py unwraps `.thinker` after load.
-        setattr(config, "enable_audio_output", False)
-        if hasattr(config, "enable_talker"):
-            setattr(config, "enable_talker", False)
+        train_talker = finetuning_args is not None and not getattr(finetuning_args, "freeze_talker", True)
+        if train_talker:
+            setattr(config, "enable_audio_output", True)
+            if hasattr(config, "enable_talker"):
+                setattr(config, "enable_talker", True)
+        else:
+            setattr(config, "enable_audio_output", False)
+            if hasattr(config, "enable_talker"):
+                setattr(config, "enable_talker", False)
 
     # replace the top-k gating method
     if getattr(config, "model_type", None) == "kimi_vl" and is_trainable:
