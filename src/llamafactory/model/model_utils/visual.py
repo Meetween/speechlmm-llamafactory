@@ -657,9 +657,6 @@ _register_composite_model(
     lipread_adapter_keys=["lipread_adapter"],
     talker_keys=["talker"],
     code2wav_keys=["code2wav"],
-    # TODO: add talker_adapter_prefixes when lora_talker is implemented
-    #   (need to decide how to handle talker.code_predictor.linear_heads ModuleList)
-    # TODO: add vision_adapter_prefixes when lora_vision_encoder is implemented
 )
 
 

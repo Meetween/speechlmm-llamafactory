@@ -215,8 +215,7 @@ def load_model(
             model_type = getattr(config, "model_type", None)
             if not finetuning_args.freeze_talker:
                 config_overrides["enable_talker"] = True
-                if model_type == "qwen2_5_omni":
-                    config_overrides["enable_code2wav"] = False
+                config_overrides["enable_code2wav"] = False
 
             if model_type == "qwen2_5_omni":
                 speechlmm_config = SpeechLMMConfig.from_qwen2_5_omni_config(
@@ -234,8 +233,8 @@ def load_model(
                 model = SpeechLMMForConditionalGeneration._wrap_qwen3_omni(
                     qwen_model, speechlmm_config
                 )
-            if lipread_encoder_weights is not None:
-                model.load_auto_avsr_weights(lipread_encoder_weights)
+            if speechlmm_config.enable_talker:
+                model.load_talker_weights(model_args.model_name_or_path)
             if hasattr(model, "load_speakers"):
                 from pathlib import Path
 
