@@ -131,6 +131,18 @@ def print_attn_implementation(config: "PretrainedConfig") -> None:
     else:
         attn_implementation = getattr(config, "_attn_implementation", None)
 
+    # Qwen-Omni, and the SpeechLMM wrapper around it, dispatch attention from
+    # the Thinker's nested text config rather than from the outer composite
+    # config. The composite is not authoritative here: Transformers fills it in
+    # with its own auto-selected default whenever no explicit request survived
+    # to that point, so reading it makes this log report the kernel the wrapper
+    # settled for instead of the one the text decoder will actually run. Prefer
+    # the config that chooses the kernel.
+    thinker_config = getattr(config, "thinker_config", None)
+    text_config = getattr(thinker_config, "text_config", None)
+    if text_config is not None:
+        attn_implementation = getattr(text_config, "_attn_implementation", attn_implementation)
+
     if attn_implementation == "flash_attention_2":
         logger.info_rank0("Using FlashAttention-2 for faster training and inference.")
     elif attn_implementation == "sdpa":

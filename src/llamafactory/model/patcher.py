@@ -283,11 +283,45 @@ def patch_model(
 
     if not model_args.use_unsloth:
         print_attn_implementation(model.config)
+        _verify_attn_implementation(model, model_args)
 
     try:
         model.add_model_tags(["llama-factory"])
     except Exception:
         logger.warning_rank0("Cannot properly tag the model.")
+
+
+def _verify_attn_implementation(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
+    """Fail loudly if the loaded model did not get the requested attention kernel.
+
+    `flash_attn` is copied verbatim into every run manifest, so a request that
+    quietly falls back to another kernel yields a run whose config, logs and
+    metadata all claim one thing while the GPU does another -- for the entire
+    length of the job, with no symptom to notice. The memory profiler has
+    always made this check before sealing a profile; the training path made
+    none, which is how `flash_attn: fa2` could have trained on SDPA across a
+    multi-day, multi-node run and been discovered only by comparing throughput
+    afterwards.
+
+    Only composite SpeechLMM models are inspected: they are the case where the
+    outer config is not authoritative, because attention is dispatched from the
+    Thinker's nested text, audio and vision configs. `flash_attn: auto` makes
+    no assertion and is not checked.
+    """
+
+    if getattr(model.config, "model_type", None) != "speechlmm":
+        return
+
+    try:
+        from speechlmm.memory_estimation.attention_backends import (
+            validate_model_attention_backends,
+        )
+    except ImportError:  # llamafactory is usable without speechlmm installed
+        return
+
+    resolved = validate_model_attention_backends(model, model_args.flash_attn)
+    if resolved:
+        logger.info_rank0(f"Verified attention backends: {resolved}.")
 
 
 def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
