@@ -103,6 +103,10 @@ def _training_function(config: dict[str, Any]) -> None:
         run_dpo(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "kto":
         run_kto(model_args, data_args, training_args, finetuning_args, callbacks)
+    elif finetuning_args.stage == "kd":
+        from .kd.workflow import run_kd
+
+        run_kd(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
