@@ -114,6 +114,7 @@ def run_kd(
         block_diag_attn=model_args.block_diag_attn,
         attn_implementation=getattr(model.config, "_attn_implementation", None),
         compute_dtype=model_args.compute_dtype,
+        media_dir=data_args.media_dir,
         **tokenizer_module,
     )
 
