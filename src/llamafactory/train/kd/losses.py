@@ -3,8 +3,9 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""KD loss pieces aligned with SpeechLMM KD decision docs (CE + symmetric JSD + optional AuT MSE)."""
+"""KD loss pieces: CE, symmetric JSD on assistant tokens, optional audio-encoder MSE."""
 
+import math
 from typing import Any, Dict, Optional
 
 import torch
@@ -18,32 +19,28 @@ def kd_jsd_shifted(
     temperature: float,
     ignore_index: int,
 ) -> torch.Tensor:
-    r"""Mean symmetric JSD over **next-token** positions (shifted vs ``labels``).
+    r"""Mean symmetric JSD over next-token positions that are not ``ignore_index``.
 
-    Uses mixture ``m = 0.5 (p_s + p_t)`` with ``p_* = softmax(logits_* / T)``.
+    Only those positions are cast to fp32. ``m = 0.5 (p_s + p_t)`` with
+    ``p_* = softmax(logits_* / T)``.
     """
     if temperature <= 0:
         raise ValueError("kd_temperature must be positive.")
 
-    logits_s = logits_s[:, :-1, :].contiguous()
-    logits_t = logits_t[:, :-1, :].contiguous()
-    lab = labels[:, 1:].contiguous()
-    mask = lab != ignore_index
-    if not mask.any():
-        return logits_s.sum() * 0.0
+    mask = labels[:, 1:] != ignore_index
+    if not bool(mask.any()):
+        return logits_s.reshape(-1)[:1].sum() * 0.0
 
-    ls = logits_s / temperature
-    lt = logits_t / temperature
-    log_p_s = F.log_softmax(ls, dim=-1)
-    log_p_t = F.log_softmax(lt, dim=-1)
+    # Boolean index gathers [N, vocab] without copying the full sequence.
+    student = logits_s[:, :-1, :][mask].float()
+    teacher = logits_t[:, :-1, :][mask].float()
+    log_p_s = F.log_softmax(student / temperature, dim=-1)
+    log_p_t = F.log_softmax(teacher / temperature, dim=-1)
     p_s = log_p_s.exp()
     p_t = log_p_t.exp()
-    m = (0.5 * (p_s + p_t)).clamp(min=1e-8)
-    log_m = m.log()
+    log_m = torch.logaddexp(log_p_s, log_p_t) - math.log(2.0)
     jsd_tok = 0.5 * ((p_s * (log_p_s - log_m)).sum(dim=-1) + (p_t * (log_p_t - log_m)).sum(dim=-1))
-    jsd_tok = jsd_tok * mask.to(jsd_tok.dtype)
-    denom = mask.sum().to(jsd_tok.dtype).clamp(min=1.0)
-    return jsd_tok.sum() / denom
+    return jsd_tok.mean()
 
 
 def kd_ce_from_logits(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:

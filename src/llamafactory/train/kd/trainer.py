@@ -6,7 +6,6 @@
 # KD trainer: dual forward (student + frozen ``ref_model`` teacher) with
 # ``w_ce * CE + w_jsd * JSD + w_aut * MSE(AuT)`` per SpeechLMM KD decision docs.
 
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
@@ -25,19 +24,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-def _tensor_device(inputs: Dict[str, Any]) -> torch.device:
-    for v in inputs.values():
-        if torch.is_tensor(v):
-            return v.device
-    return torch.device("cpu")
-
-
-def _fp32_logits_ctx(device: torch.device):
-    if device.type == "cuda":
-        return torch.amp.autocast("cuda", enabled=False)
-    return nullcontext()
 
 
 class CustomKDTrainer(CustomSeq2SeqTrainer):
@@ -97,7 +83,6 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
         fa = self.finetuning_args
-        device = _tensor_device(inputs)
 
         outputs = model(**inputs, use_cache=False, return_dict=True)
         loss_ce = outputs.loss
@@ -105,24 +90,20 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
         if loss_ce is None:
             loss_ce = kd_ce_from_logits(logits_s, labels, IGNORE_INDEX)
 
-        logits_s_f = logits_s.float()
-        jsd = torch.zeros((), device=logits_s_f.device, dtype=logits_s_f.dtype)
-
+        jsd = torch.zeros((), device=logits_s.device, dtype=torch.float32)
         if self._needs_teacher_forward():
-            with torch.inference_mode():
-                with _fp32_logits_ctx(device):
-                    out_t = self.ref_model(**inputs, use_cache=False, return_dict=True)
-            logits_t_f = out_t.logits.float()
-
-            if logits_s_f.shape == logits_t_f.shape:
-                jsd = kd_jsd_shifted(logits_s_f, logits_t_f, labels, fa.kd_temperature, IGNORE_INDEX)
+            # no_grad, not inference_mode: ZeRO-3 parameter hooks reject inference tensors.
+            with torch.no_grad():
+                out_t = self.ref_model(**inputs, use_cache=False, return_dict=True)
+            if logits_s.shape == out_t.logits.shape:
+                jsd = kd_jsd_shifted(logits_s, out_t.logits, labels, fa.kd_temperature, IGNORE_INDEX)
             elif not self._kd_jsd_shape_warned:
                 logger.warning_rank0_once(
                     "KD: student and teacher logits shapes differ; JSD term is skipped (CE + optional AuT only)."
                 )
                 self._kd_jsd_shape_warned = True
 
-        loss = fa.kd_ce_weight * loss_ce + fa.kd_jsd_weight * jsd
+        loss = fa.kd_ce_weight * loss_ce.float() + fa.kd_jsd_weight * jsd
 
         if (
             self._needs_teacher_forward()
