@@ -237,7 +237,7 @@ class RLHFArguments:
     )
     ref_model: str | None = field(
         default=None,
-        metadata={"help": "Path to the reference model used for the PPO or DPO training."},
+        metadata={"help": "Path to the reference model used for the PPO or DPO training, or the teacher in KD."},
     )
     ref_model_adapters: str | None = field(
         default=None,
@@ -271,6 +271,24 @@ class RLHFArguments:
                 " the verbose token log-probabilities in responses."
             )
         },
+    )
+
+
+@dataclass
+class KDArguments:
+    r"""Arguments pertaining to the knowledge distillation training."""
+
+    kd_ce_weight: float = field(
+        default=0.5,
+        metadata={"help": "The cross-entropy loss coefficient in KD training."},
+    )
+    kd_jsd_weight: float = field(
+        default=0.5,
+        metadata={"help": "The coefficient of the Jensen-Shannon divergence to the teacher in KD training."},
+    )
+    kd_temperature: float = field(
+        default=1.0,
+        metadata={"help": "The softmax temperature applied to student and teacher logits in KD training."},
     )
 
 
@@ -463,6 +481,7 @@ class FinetuningArguments(
     BAdamArgument,
     ApolloArguments,
     GaloreArguments,
+    KDArguments,
     RLHFArguments,
     LoraArguments,
     OFTArguments,
@@ -474,7 +493,7 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to train model in purely bf16 precision (without AMP)."},
     )
-    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "kd"] = field(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
@@ -572,6 +591,8 @@ class FinetuningArguments(
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
+        if self.stage == "kd" and self.kd_temperature <= 0:
+            raise ValueError("`kd_temperature` must be positive.")
 
         self._resolve_freeze_defaults()
         self._validate_component_lora()

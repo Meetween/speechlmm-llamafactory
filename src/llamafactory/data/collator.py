@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -247,6 +248,22 @@ def _resolve_collated_speaker_id(model: Any, name: str | None) -> int:
     return int(resolve(name, getattr(model, "speaker_map", None)))
 
 
+def _resolve_media(items: list[Any], media_dir: str | None) -> list[Any]:
+    r"""Join relative paths of tokenized rows onto ``media_dir``, as the converter does before tokenization."""
+    if not media_dir:
+        return items
+
+    resolved = []
+    for item in items:
+        if isinstance(item, str) and not os.path.isabs(item) and not os.path.exists(item):
+            joined = os.path.join(media_dir, item)
+            item = joined if os.path.isfile(joined) else item
+
+        resolved.append(item)
+
+    return resolved
+
+
 def _dummy_lipread_batch() -> tuple["torch.Tensor", "torch.Tensor"]:
     frames = DUMMY_LIPREAD_FRAMES
     return (
@@ -307,6 +324,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
     template: Optional["Template"] = None
     processor: Optional["ProcessorMixin"] = None
+    media_dir: Optional[str] = None
 
     def __post_init__(self):
         if self.template is None:
@@ -328,10 +346,10 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         batch_codec_tokens: list = []
         batch_speakers: list = []
         for feature in features:
-            images = feature.pop("images", None) or []
-            videos = feature.pop("videos", None) or []
-            audios = feature.pop("audios", None) or []
-            lipread = feature.pop("lipread", None) or []
+            images = _resolve_media(feature.pop("images", None) or [], self.media_dir)
+            videos = _resolve_media(feature.pop("videos", None) or [], self.media_dir)
+            audios = _resolve_media(feature.pop("audios", None) or [], self.media_dir)
+            lipread = _resolve_media(feature.pop("lipread", None) or [], self.media_dir)
             codec_tokens = feature.pop("codec_tokens", None)
             speaker = feature.pop("speaker", None)
             batch_images.extend(images)
