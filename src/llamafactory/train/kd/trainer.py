@@ -93,8 +93,9 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
         jsd = torch.zeros((), device=logits_s.device, dtype=torch.float32)
         if self._needs_teacher_forward():
             # no_grad, not inference_mode: ZeRO-3 parameter hooks reject inference tensors.
+            teacher_inputs = {key: value for key, value in inputs.items() if key != "labels"}
             with torch.no_grad():
-                out_t = self.ref_model(**inputs, use_cache=False, return_dict=True)
+                out_t = self.ref_model(**teacher_inputs, use_cache=False, return_dict=True)
             if logits_s.shape == out_t.logits.shape:
                 jsd = kd_jsd_shifted(logits_s, out_t.logits, labels, fa.kd_temperature, IGNORE_INDEX)
             elif not self._kd_jsd_shape_warned:
