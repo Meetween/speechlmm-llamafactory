@@ -38,6 +38,9 @@ def test_alpaca_converter():
         "_images": None,
         "_videos": None,
         "_audios": None,
+        "_lipread": None,
+        "_codec_tokens": None,
+        "_speaker": None,
     }
 
 
@@ -61,4 +64,69 @@ def test_sharegpt_converter():
         "_images": None,
         "_videos": None,
         "_audios": None,
+        "_lipread": None,
+        "_codec_tokens": None,
+        "_speaker": None,
     }
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_alpaca_explicit_speaker_and_codec():
+    dataset_attr = DatasetAttr("hf_hub", "llamafactory/tiny-supervised-dataset")
+    dataset_attr.speaker = "spk"
+    dataset_attr.codec_tokens = "codec_tokens"
+    data_args = DataArguments()
+    example = {
+        "instruction": "Say hi.",
+        "input": "",
+        "output": "Hello.",
+        "spk": "ethan",
+        "speaker": "ignored",
+        "codec_tokens": [1, 2, 3],
+    }
+    converted = get_dataset_converter("alpaca", dataset_attr, data_args)(example)
+    assert converted["_speaker"] == "ethan"
+    assert converted["_codec_tokens"] == [1, 2, 3]
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_alpaca_implicit_speaker_ignored():
+    dataset_attr = DatasetAttr("hf_hub", "llamafactory/tiny-supervised-dataset")
+    data_args = DataArguments()
+    example = {
+        "instruction": "Say hi.",
+        "input": "",
+        "output": "Hello.",
+        "speaker": "ethan",
+    }
+    converted = get_dataset_converter("alpaca", dataset_attr, data_args)(example)
+    assert converted["_speaker"] is None
+    assert converted["_codec_tokens"] is None
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_join_codec_cache_defaults_sample_id():
+    dataset_attr = DatasetAttr("file", "talker.json")
+    dataset_attr.join(
+        {
+            "formatting": "sharegpt",
+            "codec_cache": "/tmp/talker-codec-cache/qwen2_5_omni/qwen25-distill-v1",
+            "columns": {"messages": "messages", "speaker": "speaker"},
+        }
+    )
+    assert dataset_attr.codec_cache.endswith("qwen25-distill-v1")
+    assert dataset_attr.sample_id == "sample_id"
+    assert dataset_attr.speaker == "speaker"
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_join_explicit_sample_id_column():
+    dataset_attr = DatasetAttr("file", "talker.json")
+    dataset_attr.join(
+        {
+            "formatting": "sharegpt",
+            "codec_cache": "/tmp/cache",
+            "columns": {"messages": "messages", "sample_id": "id"},
+        }
+    )
+    assert dataset_attr.sample_id == "id"
