@@ -178,12 +178,50 @@ def load_model(
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         elif getattr(config, "model_type", None) == "speechlmm":
-            from speechlmm.models import SpeechLMMForConditionalGeneration
+            backbone = getattr(config, "backbone_type", None)
+            if backbone == "qwen2_5_omni":
+                from speechlmm.models.modeling_speechlmm_qwen2_5_omni import (
+                    SpeechLMMQwen2_5OmniForConditionalGeneration as SpeechLMMCls,
+                )
+            elif backbone in ("qwen3_omni", "qwen3_omni_moe"):
+                from speechlmm.models.modeling_speechlmm_qwen3_omni import (
+                    SpeechLMMQwen3OmniForConditionalGeneration as SpeechLMMCls,
+                )
+            else:
+                from speechlmm.models import SpeechLMMForConditionalGeneration as SpeechLMMCls
+
+            if is_trainable:
+                setattr(config, "enable_code2wav", False)
+                has_trainable_adapters = bool(finetuning_args.trainable_module_paths)
+                has_trainable_lipread = (
+                    not finetuning_args.freeze_lipread_encoder
+                    or not finetuning_args.freeze_lipread_adapter
+                )
+                if (
+                    finetuning_args.freeze_language_model
+                    and not has_trainable_adapters
+                    and not has_trainable_lipread
+                ):
+                    setattr(config, "thinker_loss_weight", 0.0)
+                if not finetuning_args.freeze_talker:
+                    setattr(config, "enable_talker", True)
 
             if model_args.train_from_scratch:
-                model = SpeechLMMForConditionalGeneration._from_config(config)
+                model = SpeechLMMCls._from_config(config)
             else:
-                model = SpeechLMMForConditionalGeneration.from_pretrained(**init_kwargs)
+                model = SpeechLMMCls.from_pretrained(**init_kwargs)
+            if is_trainable:
+                spk_path = os.path.join(str(model_args.model_name_or_path), "spk_dict.pt")
+                if os.path.isfile(spk_path) and hasattr(model, "load_speakers") and not getattr(
+                    model, "speaker_map", None
+                ):
+                    model.load_speakers(spk_path)
+                speaker_map = getattr(model, "speaker_map", None)
+                resolve_speaker = getattr(model.config, "resolve_talker_speaker_id", None)
+                if speaker_map and callable(resolve_speaker):
+                    model.config.speaker_bos_token_id = resolve_speaker(
+                        model.config.talker_speaker, speaker_map
+                    )
 
         elif model_args.use_speechlmm_wrapper and getattr(config, "model_type", None) in (
             "qwen2_5_omni",
