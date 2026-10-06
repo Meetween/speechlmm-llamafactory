@@ -237,7 +237,7 @@ class RLHFArguments:
     )
     ref_model: str | None = field(
         default=None,
-        metadata={"help": "Path to the reference model used for the PPO or DPO training."},
+        metadata={"help": "Path to the reference model used for the PPO or DPO training, or the teacher in KD."},
     )
     ref_model_adapters: str | None = field(
         default=None,
@@ -271,6 +271,24 @@ class RLHFArguments:
                 " the verbose token log-probabilities in responses."
             )
         },
+    )
+
+
+@dataclass
+class KDArguments:
+    r"""Arguments pertaining to the knowledge distillation training."""
+
+    kd_ce_weight: float = field(
+        default=0.5,
+        metadata={"help": "The cross-entropy loss coefficient in KD training."},
+    )
+    kd_jsd_weight: float = field(
+        default=0.5,
+        metadata={"help": "The coefficient of the Jensen-Shannon divergence to the teacher in KD training."},
+    )
+    kd_temperature: float = field(
+        default=1.0,
+        metadata={"help": "The softmax temperature applied to student and teacher logits in KD training."},
     )
 
 
@@ -463,6 +481,7 @@ class FinetuningArguments(
     BAdamArgument,
     ApolloArguments,
     GaloreArguments,
+    KDArguments,
     RLHFArguments,
     LoraArguments,
     OFTArguments,
@@ -555,30 +574,6 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
-    kd_ce_weight: float = field(
-        default=0.5,
-        metadata={"help": "Weight for supervised CE on gold labels. Used when `stage` is `kd`."},
-    )
-    kd_jsd_weight: float = field(
-        default=0.5,
-        metadata={"help": "Weight for token-wise symmetric JSD between student and teacher logits."},
-    )
-    kd_temperature: float = field(
-        default=2.0,
-        metadata={"help": "Temperature applied to logits before the JSD softmax."},
-    )
-    kd_aut_mse_weight: float = field(
-        default=0.1,
-        metadata={"help": "Weight for MSE between student and teacher audio-encoder hidden states."},
-    )
-    kd_enable_aut_mse: bool = field(
-        default=False,
-        metadata={"help": "Add the audio-encoder MSE term when both models expose `get_audio_features`."},
-    )
-    kd_stage0_projector_only: bool = field(
-        default=False,
-        metadata={"help": "Freeze everything except the multimodal projectors. Use with `finetuning_type: full`."},
-    )
 
     def __post_init__(self):
         def split_arg(arg):
@@ -595,9 +590,7 @@ class FinetuningArguments(
         self.additional_target: list[str] | None = split_arg(self.additional_target)
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
-        self.use_ref_model = self.stage == "kd" or (
-            self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
-        )
+        self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
         if self.stage == "kd" and self.kd_temperature <= 0:
             raise ValueError("`kd_temperature` must be positive.")
 
