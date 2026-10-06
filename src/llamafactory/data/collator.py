@@ -253,11 +253,13 @@ def _resolve_media_path(item: Any, media_dir: str | None) -> Any:
 
     Pretokenized rows store paths like ``fleurs/v1.0/signals/...``. Those are
     resolved at tokenization time only, so a later ``tokenized_path`` load
-    still has to do it here.
+    still has to do it here. Like the converter, keep the path unless the
+    joined file exists.
     """
-    if not media_dir or not isinstance(item, str) or os.path.isabs(item):
+    if not media_dir or not isinstance(item, str) or os.path.isabs(item) or os.path.exists(item):
         return item
-    return os.path.join(media_dir, item)
+    joined = os.path.join(media_dir, item)
+    return joined if os.path.isfile(joined) else item
 
 
 def _resolve_media_list(items: list[Any] | None, media_dir: str | None) -> list[Any]:

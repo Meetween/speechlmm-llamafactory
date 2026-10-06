@@ -15,6 +15,9 @@ kd_enable_aut_mse: false
 The loss is `kd_ce_weight * CE + kd_jsd_weight * JSD(T)` on assistant tokens.
 `kd_enable_aut_mse: true` adds an audio-encoder MSE term. It is off by default.
 
+With `tokenized_path`, set `media_dir` to the media root. Relative audio, image
+and video paths in the tokenized rows are joined onto it when collating.
+
 | File | Role |
 |------|------|
 | `workflow.py` | SFT dataset and collator, frozen teacher via `ref_model` |
