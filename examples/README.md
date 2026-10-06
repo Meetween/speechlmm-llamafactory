@@ -167,6 +167,12 @@ FORCE_TORCHRUN=1 MIN_NNODES=1 MAX_NNODES=3 MAX_RESTARTS=3 RDZV_ID=llamafactory M
 FORCE_TORCHRUN=1 llamafactory-cli train examples/train_full/qwen3vl_full_sft.yaml
 ```
 
+#### Knowledge Distillation from a Frozen Teacher
+
+```bash
+FORCE_TORCHRUN=1 llamafactory-cli train examples/train_full/qwen3_full_kd.yaml
+```
+
 ### Merging LoRA Adapters and Quantization
 
 #### Merge LoRA Adapters
