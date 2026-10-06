@@ -24,7 +24,11 @@ from transformers.modeling_utils import is_fsdp_enabled
 from ..extras import logging
 from ..extras.misc import infer_optim_dtype
 from ..extras.packages import is_transformers_version_greater_than
-from .model_utils.attention import configure_attn_implementation, print_attn_implementation
+from .model_utils.attention import (
+    configure_attn_implementation,
+    print_attn_implementation,
+    verify_attn_implementation,
+)
 from .model_utils.checkpointing import prepare_model_for_training
 from .model_utils.embedding import resize_embedding_layer
 from .model_utils.kv_cache import configure_kv_cache
@@ -295,6 +299,7 @@ def patch_model(
 
     if not model_args.use_unsloth:
         print_attn_implementation(model.config)
+        verify_attn_implementation(model, model_args)
 
     try:
         model.add_model_tags(["llama-factory"])

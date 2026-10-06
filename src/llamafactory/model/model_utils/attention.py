@@ -20,7 +20,7 @@ from ...extras.packages import is_torch_version_greater_than
 
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
+    from transformers import PretrainedConfig, PreTrainedModel
 
     from ...hparams import ModelArguments
 
@@ -107,9 +107,35 @@ def print_attn_implementation(config: "PretrainedConfig") -> None:
     else:
         attn_implementation = getattr(config, "_attn_implementation", None)
 
+    # Qwen-Omni and SpeechLMM dispatch attention from the Thinker's text config.
+    text_config = getattr(getattr(config, "thinker_config", None), "text_config", None)
+    if text_config is not None:
+        attn_implementation = getattr(text_config, "_attn_implementation", attn_implementation)
+
     if attn_implementation == "flash_attention_2":
         logger.info_rank0("Using FlashAttention-2 for faster training and inference.")
     elif attn_implementation == "sdpa":
         logger.info_rank0("Using torch SDPA for faster training and inference.")
     else:
         logger.info_rank0("Using vanilla attention implementation.")
+
+
+def verify_attn_implementation(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
+    r"""Raise if a SpeechLMM attention module did not get the requested kernel."""
+    expected = {
+        AttentionFunction.DISABLED: "eager",
+        AttentionFunction.SDPA: "sdpa",
+        AttentionFunction.FA2: "flash_attention_2",
+    }.get(model_args.flash_attn)
+    if expected is None or getattr(model.config, "model_type", None) != "speechlmm":
+        return
+
+    found = {}
+    for name in ("model", "audio_tower", "visual"):
+        config = getattr(getattr(model, name, None), "config", None)
+        if config is not None:
+            found[name] = getattr(config, "_attn_implementation", None)
+
+    mismatched = {name: impl for name, impl in found.items() if impl != expected}
+    if mismatched:
+        raise ValueError(f"Requested {expected} attention, but these modules use another kernel: {mismatched}.")
