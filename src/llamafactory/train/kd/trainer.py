@@ -78,6 +78,29 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
         return (loss, outputs) if return_outputs else loss
 
     @override
+    def evaluate(self, eval_dataset=None, *args, **kwargs):
+        metric_key_prefix = kwargs.get("metric_key_prefix", "eval")
+        metrics = super().evaluate(eval_dataset, *args, **kwargs)
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        # Each split loss is a mean over its own rows. Weight by row count so a
+        # short split does not count as much as a long one. The heal monitor has
+        # 16 rows in every split, so this is their unweighted mean.
+        if isinstance(dataset, dict):
+            total = 0.0
+            rows = 0
+            for name, subset in dataset.items():
+                loss = metrics.get(f"{metric_key_prefix}_{name}_loss")
+                if loss is None:
+                    continue
+                n = len(subset)
+                total += float(loss) * n
+                rows += n
+            if rows:
+                metrics[f"{metric_key_prefix}_loss"] = total / rows
+                self.log({f"{metric_key_prefix}_loss": metrics[f"{metric_key_prefix}_loss"]})
+        return metrics
+
+    @override
     def log(self, logs: dict[str, float], *args, **kwargs) -> None:
         r"""Add the averaged CE and JSD terms to the training or eval log."""
         bucket = "eval" if "eval_loss" in logs else "train"
