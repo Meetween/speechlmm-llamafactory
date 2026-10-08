@@ -71,8 +71,14 @@ def _training_function(config: dict[str, Any]) -> None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=finetuning_args.early_stopping_steps))
 
     trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
+    periodic_save_steps = getattr(model_args, "periodic_trainable_save_steps", None)
+    if periodic_save_steps is not None:
+        if not trainable_paths:
+            raise ValueError("periodic_trainable_save_steps requires trainable_module_paths.")
+        if training_args.save_strategy != "no":
+            raise ValueError("periodic_trainable_save_steps requires save_strategy: 'no'.")
     if trainable_paths:
-        callbacks.append(SaveTrainableModulesCallback(trainable_paths))
+        callbacks.append(SaveTrainableModulesCallback(trainable_paths, periodic_save_steps))
 
     callbacks.append(ReporterCallback(model_args, data_args, finetuning_args, generating_args))  # add to last
 
