@@ -23,6 +23,7 @@ from transformers import EarlyStoppingCallback, PreTrainedModel
 from ..data import get_template_and_fix_tokenizer
 from ..extras import logging
 from ..extras.constants import V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
+from ..extras.file_perms import install_safetensors_umask
 from ..extras.misc import find_available_port, get_device_name, get_torch_device, infer_optim_dtype
 from ..extras.packages import is_mcore_adapter_available, is_ray_available
 from ..hparams import RayArguments, get_infer_args, get_ray_args, get_train_args, read_args
@@ -120,6 +121,7 @@ def _training_function(config: dict[str, Any]) -> None:
 
 
 def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["TrainerCallback"]] = None) -> None:
+    install_safetensors_umask()
     args = read_args(args)
     if "-h" in args or "--help" in args:
         get_train_args(args)
@@ -133,6 +135,7 @@ def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["Tra
 
 
 def export_model(args: Optional[dict[str, Any]] = None) -> None:
+    install_safetensors_umask()
     model_args, data_args, finetuning_args, _ = get_infer_args(args)
 
     if model_args.export_dir is None:
