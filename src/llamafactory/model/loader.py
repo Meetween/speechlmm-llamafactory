@@ -280,9 +280,11 @@ def load_model(
 
     # AutoAVSR BN running stats are dropped under ZeRO-3 / PEFT; reload the
     # configured .pth whenever it is set. load_auto_avsr_weights is ZeRO-3-safe.
+    # A trainable encoder keeps its weights and only gets the BN stats back.
     lipread_weights = getattr(model_args, "lipread_encoder_weights", None)
     if lipread_weights and hasattr(model, "load_auto_avsr_weights"):
-        model.load_auto_avsr_weights(lipread_weights)
+        encoder_trainable = not finetuning_args.freeze_lipread_encoder or finetuning_args.lora_lipread_encoder
+        model.load_auto_avsr_weights(lipread_weights, buffers_only=encoder_trainable)
         logger.info_rank0(f"Loaded AutoAVSR lipread encoder from {lipread_weights}")
 
     if add_valuehead:
