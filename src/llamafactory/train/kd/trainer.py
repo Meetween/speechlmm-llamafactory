@@ -55,6 +55,7 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
                 self.ref_model = self.accelerator.prepare_model(ref_model, evaluation_mode=True)
 
             self.ref_model.eval()
+        self._kd_terms = {"train": None, "eval": None}  # running [ce_sum, jsd_sum, steps]
 
     @override
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -70,5 +71,49 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
         jsd = jsd_loss(
             outputs.logits, teacher_logits, inputs["labels"], self.finetuning_args.kd_temperature, IGNORE_INDEX
         )
+        step = torch.stack((outputs.loss.detach().float(), jsd.detach().float(), torch.ones_like(jsd).float()))
+        bucket = "train" if model.training else "eval"
+        sums = self._kd_terms[bucket]
+        self._kd_terms[bucket] = step if sums is None else sums + step
         loss = self.finetuning_args.kd_ce_weight * outputs.loss.float() + self.finetuning_args.kd_jsd_weight * jsd
         return (loss, outputs) if return_outputs else loss
+
+    @override
+    def evaluate(self, eval_dataset=None, *args, **kwargs):
+        metric_key_prefix = kwargs.get("metric_key_prefix", "eval")
+        metrics = super().evaluate(eval_dataset, *args, **kwargs)
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        # Each split loss is a mean over its own rows. Weight by row count so a
+        # short split does not count as much as a long one. The heal monitor has
+        # 16 rows in every split, so this is their unweighted mean.
+        if isinstance(dataset, dict):
+            total = 0.0
+            rows = 0
+            for name, subset in dataset.items():
+                loss = metrics.get(f"{metric_key_prefix}_{name}_loss")
+                if loss is None:
+                    continue
+                n = len(subset)
+                total += float(loss) * n
+                rows += n
+            if rows:
+                metrics[f"{metric_key_prefix}_loss"] = total / rows
+                self.log({f"{metric_key_prefix}_loss": metrics[f"{metric_key_prefix}_loss"]})
+        return metrics
+
+    @override
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        r"""Add the averaged CE and JSD terms to the training or eval log."""
+        if "loss" in logs or "eval_loss" in logs:
+            bucket = "eval" if "eval_loss" in logs else "train"
+            sums = self._kd_terms[bucket]
+            if sums is None:
+                sums = torch.zeros(3, device=self.accelerator.device)
+            # Every rank reaches this reduce, including one with no terms, so it cannot hang.
+            ce_sum, jsd_sum, steps = self.accelerator.reduce(sums, "sum").tolist()
+            self._kd_terms[bucket] = None
+            if steps:
+                prefix = "eval_" if bucket == "eval" else ""
+                logs[f"{prefix}kd_ce"] = ce_sum / steps
+                logs[f"{prefix}kd_jsd"] = jsd_sum / steps
+        return super().log(logs, *args, **kwargs)

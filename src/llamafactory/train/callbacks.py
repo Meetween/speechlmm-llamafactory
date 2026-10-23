@@ -178,8 +178,9 @@ class SaveTrainableModulesCallback(TrainerCallback):
     Written in each checkpoint so export_checkpoint.py can reconstruct the full model.
     """
 
-    def __init__(self, trainable_module_paths: list[str]) -> None:
+    def __init__(self, trainable_module_paths: list[str], periodic_save_steps: int | None = None) -> None:
         self.trainable_module_paths = trainable_module_paths
+        self.periodic_save_steps = periodic_save_steps
 
     def _matches(self, name: str) -> bool:
         clean = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
@@ -212,12 +213,27 @@ class SaveTrainableModulesCallback(TrainerCallback):
             )
 
     @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if not self.periodic_save_steps:
+            return
+        if state.global_step % self.periodic_save_steps != 0 and state.global_step != state.max_steps:
+            return
+        output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+        self._save_trainable_modules(kwargs["model"], output_dir)
+        if state.is_world_process_zero:
+            state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+
+    @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
         self._save_trainable_modules(kwargs["model"], output_dir)
 
     @override
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        # Gathering right after the final evaluation fails under ZeRO-3 (param in flight);
+        # periodic mode already saved the last step in on_step_end.
+        if self.periodic_save_steps:
+            return
         self._save_trainable_modules(kwargs["model"], args.output_dir)
 
 
