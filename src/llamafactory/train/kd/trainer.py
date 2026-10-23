@@ -55,7 +55,7 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
                 self.ref_model = self.accelerator.prepare_model(ref_model, evaluation_mode=True)
 
             self.ref_model.eval()
-        self._kd_terms = {"train": [], "eval": []}
+        self._kd_terms = {"train": None, "eval": None}  # running [ce_sum, jsd_sum, steps]
 
     @override
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -71,9 +71,10 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
         jsd = jsd_loss(
             outputs.logits, teacher_logits, inputs["labels"], self.finetuning_args.kd_temperature, IGNORE_INDEX
         )
-        ce = outputs.loss.detach().float()
+        step = torch.stack((outputs.loss.detach().float(), jsd.detach().float(), torch.ones_like(jsd).float()))
         bucket = "train" if model.training else "eval"
-        self._kd_terms[bucket].append((ce.item(), jsd.detach().float().item()))
+        sums = self._kd_terms[bucket]
+        self._kd_terms[bucket] = step if sums is None else sums + step
         loss = self.finetuning_args.kd_ce_weight * outputs.loss.float() + self.finetuning_args.kd_jsd_weight * jsd
         return (loss, outputs) if return_outputs else loss
 
@@ -103,13 +104,16 @@ class CustomKDTrainer(CustomSeq2SeqTrainer):
     @override
     def log(self, logs: dict[str, float], *args, **kwargs) -> None:
         r"""Add the averaged CE and JSD terms to the training or eval log."""
-        bucket = "eval" if "eval_loss" in logs else "train"
-        terms = self._kd_terms[bucket]
-        if terms and ("loss" in logs or "eval_loss" in logs):
-            stacked = torch.tensor(terms, dtype=torch.float, device=self.accelerator.device).mean(dim=0)
-            ce, jsd = self.accelerator.reduce(stacked, "mean").tolist()
-            prefix = "eval_" if bucket == "eval" else ""
-            logs[f"{prefix}kd_ce"] = ce
-            logs[f"{prefix}kd_jsd"] = jsd
-            terms.clear()
+        if "loss" in logs or "eval_loss" in logs:
+            bucket = "eval" if "eval_loss" in logs else "train"
+            sums = self._kd_terms[bucket]
+            if sums is None:
+                sums = torch.zeros(3, device=self.accelerator.device)
+            # Every rank reaches this reduce, including one with no terms, so it cannot hang.
+            ce_sum, jsd_sum, steps = self.accelerator.reduce(sums, "sum").tolist()
+            self._kd_terms[bucket] = None
+            if steps:
+                prefix = "eval_" if bucket == "eval" else ""
+                logs[f"{prefix}kd_ce"] = ce_sum / steps
+                logs[f"{prefix}kd_jsd"] = jsd_sum / steps
         return super().log(logs, *args, **kwargs)
