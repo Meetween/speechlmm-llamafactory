@@ -188,16 +188,8 @@ def patch_config(
         setattr(config, "init_audio", True)
         setattr(config, "init_tts", False)
 
-    if getattr(config, "model_type", None) == "qwen2_5_omni" and is_trainable:
-        train_talker = finetuning_args is not None and not getattr(finetuning_args, "freeze_talker", True)
-        if train_talker:
-            setattr(config, "enable_audio_output", True)
-            if hasattr(config, "enable_talker"):
-                setattr(config, "enable_talker", True)
-        else:
-            setattr(config, "enable_audio_output", False)
-            if hasattr(config, "enable_talker"):
-                setattr(config, "enable_talker", False)
+    if getattr(config, "model_type", None) in ("qwen2_5_omni", "qwen3_omni_moe") and is_trainable:
+        setattr(config, "enable_audio_output", False)
 
     # replace the top-k gating method
     if getattr(config, "model_type", None) == "kimi_vl" and is_trainable:

@@ -174,7 +174,7 @@ def add_z3_leaf_module(model: "PreTrainedModel") -> None:
         if any(isinstance(module, Qwen3OmniMoeThinkerTextSparseMoeBlock) for module in model.modules()):
             leaf_types = [Qwen3OmniMoeThinkerTextSparseMoeBlock]
             talker = getattr(model, "talker", None)
-            if talker is not None and any(param.requires_grad for param in talker.parameters()):
+            if talker is not None:
                 try:
                     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
                         Qwen3OmniMoeTalkerTextSparseMoeBlock,
