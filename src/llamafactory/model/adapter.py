@@ -16,7 +16,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from peft import LoraConfig, LoraModel, OFTConfig, PeftModel, TaskType, get_peft_model
+from peft import LoraConfig, OFTConfig, PeftModel, TaskType, get_peft_model
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from ..extras import logging
@@ -24,8 +24,19 @@ from ..extras.constants import EngineName
 from .model_utils.ktransformers import get_kt_peft_model, load_kt_peft_model
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
+from .model_utils.qwen3_omni_moe_lora import (
+    create_lora_config_with_expert_lora,
+    force_eager_experts_on_model,
+    load_peft_model_maybe_expert_lora,
+)
 from .model_utils.unsloth import get_unsloth_peft_model, load_unsloth_peft_model
-from .model_utils.visual import COMPOSITE_MODELS, get_forbidden_modules, patch_target_modules
+from .model_utils.visual import (
+    COMPOSITE_MODELS,
+    _matches_prefix,
+    build_component_lora_targets,
+    get_forbidden_modules,
+    patch_target_modules,
+)
 
 
 if TYPE_CHECKING:
@@ -35,6 +46,31 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _peft_exact_target_modules(names: list[str]) -> str | list[str]:
+    """Join full module paths so PEFT uses ``re.fullmatch``, not suffix matching.
+
+    PEFT list-mode matching uses ``key.endswith(target)``, so
+    ``model.layers.0.q_proj`` also matches ``talker.model.layers.0.q_proj``.
+    A regex of escaped full paths is exact. Drop this if PEFT adds native
+    exact-match support for ``target_modules`` lists.
+    """
+    if not names:
+        return names
+    return "|".join(re.escape(n) for n in names)
+
+
+def _needs_expert_lora(finetuning_args: "FinetuningArguments") -> bool:
+    return bool(getattr(finetuning_args, "lora_language_model_experts", False))
+
+
+def _force_eager_thinker_experts(model: "PreTrainedModel", config: "PretrainedConfig") -> None:
+    """Force eager expert backends on configs and fused Thinker expert modules."""
+    from .patcher import ensure_eager_thinker_experts
+
+    ensure_eager_thinker_experts(config)
+    force_eager_experts_on_model(model)
 
 
 def _setup_full_tuning(
@@ -47,9 +83,13 @@ def _setup_full_tuning(
         return
 
     logger.info_rank0("Fine-tuning method: Full")
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if not any(forbidden_module in name for forbidden_module in forbidden_modules):
+        if _matches_prefix(name, trainable_paths):
+            if cast_trainable_params_to_fp32:
+                param.data = param.data.to(torch.float32)
+        elif not any(forbidden_module in name for forbidden_module in forbidden_modules):
             if cast_trainable_params_to_fp32:
                 param.data = param.data.to(torch.float32)
         else:
@@ -127,9 +167,13 @@ def _setup_freeze_tuning(
     if not finetuning_args.freeze_multi_modal_projector and model_type in COMPOSITE_MODELS:
         trainable_layers.append(COMPOSITE_MODELS[model_type].projector_key)
 
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
-        if any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
+        if _matches_prefix(name, trainable_paths):
+            if cast_trainable_params_to_fp32:
+                param.data = param.data.to(torch.float32)
+        elif any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
             forbidden_module in name for forbidden_module in forbidden_modules
         ):
             if cast_trainable_params_to_fp32:
@@ -195,7 +239,7 @@ def _setup_lora_tuning(
                 )
 
         for adapter in adapter_to_merge:
-            model: LoraModel = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = load_peft_model_maybe_expert_lora(model, adapter, **init_kwargs)
             model = model.merge_and_unload()
 
         if len(adapter_to_merge) > 0:
@@ -207,30 +251,59 @@ def _setup_lora_tuning(
             elif model_args.use_unsloth:
                 model = load_unsloth_peft_model(config, model_args, finetuning_args, is_trainable=is_trainable)
             else:
-                model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+                model = load_peft_model_maybe_expert_lora(
+                    model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs
+                )
 
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
-        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        # TODO: extend when adding lora_vision_encoder, lora_code2wav
+        _component_flags = (
+            "lora_audio_encoder",
+            "lora_audio_adapters",
+            "lora_language_model",
+            "lora_lipread_encoder",
+            "lora_lipread_adapter",
+            "lora_talker",
+        )
+        has_component_lora = any(getattr(finetuning_args, f, False) for f in _component_flags)
+
+        if has_component_lora:
+            target_module_list, rank_pattern, alpha_pattern = build_component_lora_targets(model, finetuning_args)
+            if not target_module_list:
+                raise ValueError(
+                    "Component LoRA flags are set but no matching Linear modules were found. "
+                    "Check that the model type supports component-based LoRA configuration."
+                )
+            logger.info_rank0(f"Component LoRA: {len(target_module_list)} target modules selected.")
+            target_modules = _peft_exact_target_modules(target_module_list)
         else:
-            target_modules = finetuning_args.lora_target
+            if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+                target_modules = find_all_linear_modules(
+                    model, finetuning_args.freeze_vision_tower, finetuning_args.freeze_audio_tower
+                )
+            else:
+                target_modules = finetuning_args.lora_target
 
-        if model_args.use_kt:
-            new_list = []
-            for m in target_modules:
-                if m in ("down_proj", "up_proj", "gate_proj"):
-                    new_list.extend([f"mlp.{m}", f"shared_experts.{m}"])
-                elif m not in ("generate_linear", "orig_module", "prefill_linear"):
-                    new_list.append(m)
+            if model_args.use_kt:
+                new_list = []
+                for m in target_modules:
+                    if m in ("down_proj", "up_proj", "gate_proj"):
+                        new_list.extend([f"mlp.{m}", f"shared_experts.{m}"])
+                    elif m not in ("generate_linear", "orig_module", "prefill_linear"):
+                        new_list.append(m)
 
-            target_modules[:] = new_list
+                target_modules[:] = new_list
 
-        if finetuning_args.use_llama_pro:
-            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+            if finetuning_args.use_llama_pro:
+                target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+            if getattr(model.config, "model_type", None) in COMPOSITE_MODELS:
+                target_modules = _peft_exact_target_modules(target_modules)
+            rank_pattern = {}
+            alpha_pattern = {}
 
         if (
             finetuning_args.use_dora
@@ -239,7 +312,13 @@ def _setup_lora_tuning(
         ):
             raise ValueError("DoRA is not compatible with PTQ-quantized models.")
 
-        if model_args.resize_vocab and finetuning_args.additional_target is None:
+        modules_to_save = finetuning_args.additional_target
+        trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
+        if trainable_paths and is_deepspeed_zero3_enabled() and modules_to_save:
+            logger.warning_rank0("Dropping modules_to_save (incompatible with ZeRO-3); using trainable_module_paths.")
+            modules_to_save = None
+
+        if model_args.resize_vocab and modules_to_save is None and not trainable_paths:
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
             module_names = set()
@@ -247,7 +326,7 @@ def _setup_lora_tuning(
                 if module in [input_embeddings, output_embeddings]:
                     module_names.add(name.split(".")[-1])
 
-            finetuning_args.additional_target = module_names
+            modules_to_save = list(module_names)
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
         if finetuning_args.finetuning_type == "lora":
@@ -258,20 +337,26 @@ def _setup_lora_tuning(
                 "lora_dropout": finetuning_args.lora_dropout,
                 "use_rslora": finetuning_args.use_rslora,
                 "use_dora": finetuning_args.use_dora,
-                "modules_to_save": finetuning_args.additional_target,
+                "modules_to_save": modules_to_save,
             }
+            if rank_pattern:
+                peft_kwargs["rank_pattern"] = rank_pattern
+            if alpha_pattern:
+                peft_kwargs["alpha_pattern"] = alpha_pattern
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
                 "r": finetuning_args.oft_rank,
                 "oft_block_size": finetuning_args.oft_block_size,
                 "target_modules": target_modules,
                 "module_dropout": finetuning_args.module_dropout,
-                "modules_to_save": finetuning_args.additional_target,
+                "modules_to_save": modules_to_save,
             }
 
         if model_args.use_kt:
             if finetuning_args.finetuning_type == "oft":
                 raise ValueError("KTransformers is currently not supported for OFT.")
+            if _needs_expert_lora(finetuning_args):
+                raise ValueError("lora_language_model_experts is not supported with KTransformers.")
             if finetuning_args.finetuning_type == "lora":
                 peft_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
@@ -286,6 +371,8 @@ def _setup_lora_tuning(
         elif model_args.use_unsloth:
             if finetuning_args.finetuning_type == "oft":
                 raise ValueError("Unsloth is currently not supported for OFT.")
+            if _needs_expert_lora(finetuning_args):
+                raise ValueError("lora_language_model_experts is currently not supported with Unsloth.")
 
             model = get_unsloth_peft_model(model, model_args, peft_kwargs)
         else:
@@ -298,11 +385,25 @@ def _setup_lora_tuning(
                     peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
 
             if finetuning_args.finetuning_type == "lora":
-                peft_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    inference_mode=False,
-                    **peft_kwargs,
-                )
+                if _needs_expert_lora(finetuning_args):
+                    if finetuning_args.pissa_init:
+                        raise ValueError("lora_language_model_experts does not support PiSSA initialization.")
+                    if finetuning_args.use_dora:
+                        raise ValueError("lora_language_model_experts does not support DoRA.")
+                    if is_deepspeed_zero3_enabled() and model_args.adapter_name_or_path is not None:
+                        if len(model_args.adapter_name_or_path) > 1:
+                            raise ValueError(
+                                "lora_language_model_experts supports only a single adapter under ZeRO-3."
+                            )
+                    _force_eager_thinker_experts(model, config)
+                    peft_config = create_lora_config_with_expert_lora(**peft_kwargs)
+                    logger.info_rank0("Registered custom LoRA layer for Qwen3-Omni Thinker fused MoE experts.")
+                else:
+                    peft_config = LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        inference_mode=False,
+                        **peft_kwargs,
+                    )
             elif finetuning_args.finetuning_type == "oft":
                 peft_config = OFTConfig(
                     task_type=TaskType.CAUSAL_LM,
@@ -310,6 +411,16 @@ def _setup_lora_tuning(
                     **peft_kwargs,
                 )
             model = get_peft_model(model, peft_config)
+
+        if trainable_paths:
+            unfrozen_count = 0
+            for name, param in model.named_parameters():
+                clean_name = name.replace("base_model.model.", "", 1) if name.startswith("base_model.model.") else name
+                if _matches_prefix(clean_name, trainable_paths) and not param.requires_grad:
+                    param.requires_grad_(True)
+                    unfrozen_count += 1
+            if unfrozen_count > 0:
+                logger.info_rank0(f"Unfroze {unfrozen_count} params via trainable_module_paths.")
 
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):

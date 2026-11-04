@@ -15,6 +15,7 @@ import json
 import os
 from abc import abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
 from ..extras import logging
@@ -39,6 +40,43 @@ logger = logging.get_logger(__name__)
 class DatasetConverter:
     dataset_attr: "DatasetAttr"
     data_args: "DataArguments"
+
+    def _codec_and_speaker(self, example: dict[str, Any]) -> tuple[Any, Any]:
+        """Read codec/speaker only from columns declared in dataset_info.
+
+        Implicit ``codec_tokens`` / ``speaker`` keys are ignored unless listed
+        under ``columns`` (or ``sample_id`` when ``codec_cache`` is set).
+        """
+        codec_key = self.dataset_attr.codec_tokens
+        speaker_key = self.dataset_attr.speaker
+        codec = example.get(codec_key) if codec_key else None
+        speaker = example.get(speaker_key) if speaker_key else None
+        if codec is None:
+            codec = self._lookup_cached_codec(self._sample_id(example))
+        return codec, speaker
+
+    def _sample_id(self, example: dict[str, Any]) -> str | None:
+        key = self.dataset_attr.sample_id
+        if not key:
+            return None
+        value = example.get(key)
+        return None if value is None else str(value)
+
+    def _lookup_cached_codec(self, sample_id: str | None) -> Any:
+        cache_dir = self.dataset_attr.codec_cache
+        if not sample_id or not cache_dir:
+            return None
+        cache = getattr(self, "_codec_cache", None)
+        if cache is None:
+            from speechlmm.data.codec_cache import CodecCache
+
+            path = Path(cache_dir)
+            if not path.is_absolute():
+                path = Path(self.data_args.dataset_dir) / path
+            cache = CodecCache.from_dir(path)
+            self._codec_cache = cache
+        record = cache.lookup(sample_id=sample_id)
+        return None if record is None else record.codes
 
     def _find_medias(self, medias: Union["MediaType", list["MediaType"], None]) -> list["MediaType"] | None:
         r"""Optionally concatenate media path to media dir when loading from local disk."""
@@ -119,6 +157,7 @@ class AlpacaDatasetConverter(DatasetConverter):
         else:  # unsupervised
             response = []
 
+        codec, speaker = self._codec_and_speaker(example)
         output = {
             "_prompt": prompt,
             "_response": response,
@@ -127,6 +166,9 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_lipread": self._find_medias(example[self.dataset_attr.lipread]) if self.dataset_attr.lipread else None,
+            "_codec_tokens": codec,
+            "_speaker": speaker,
         }
         return output
 
@@ -215,6 +257,7 @@ class SharegptDatasetConverter(DatasetConverter):
             prompt = aligned_messages[:-1]
             response = aligned_messages[-1:]
 
+        codec, speaker = self._codec_and_speaker(example)
         output = {
             "_prompt": prompt,
             "_response": response,
@@ -223,6 +266,9 @@ class SharegptDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_lipread": self._find_medias(example[self.dataset_attr.lipread]) if self.dataset_attr.lipread else None,
+            "_codec_tokens": codec,
+            "_speaker": speaker,
         }
         return output
 
@@ -355,6 +401,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             else:
                 system += "\n"
 
+        codec, speaker = self._codec_and_speaker(example)
         output = {
             "_prompt": prompt,
             "_response": response,
@@ -363,6 +410,9 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_lipread": self._find_medias(example[self.dataset_attr.lipread]) if self.dataset_attr.lipread else None,
+            "_codec_tokens": codec,
+            "_speaker": speaker,
         }
         return output
 
@@ -406,6 +456,7 @@ def align_dataset(
     _images: []
     _videos: []
     _audios: []
+    _codec_tokens: [] | None
     """
     column_names = list(next(iter(dataset)).keys())
     kwargs = {}

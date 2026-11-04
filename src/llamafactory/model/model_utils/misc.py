@@ -25,7 +25,9 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-def find_all_linear_modules(model: "PreTrainedModel", freeze_vision_tower: bool) -> list[str]:
+def find_all_linear_modules(
+    model: "PreTrainedModel", freeze_vision_tower: bool, freeze_audio_tower: bool = True
+) -> list[str]:
     r"""Find all available modules to apply LoRA, GaLore or APOLLO."""
     model_type = getattr(model.config, "model_type", None)
     forbidden_modules = {"lm_head"}
@@ -39,6 +41,9 @@ def find_all_linear_modules(model: "PreTrainedModel", freeze_vision_tower: bool)
 
     if freeze_vision_tower and model_type in COMPOSITE_MODELS:
         forbidden_modules.update(COMPOSITE_MODELS[model_type].vision_model_keys)
+
+    if freeze_audio_tower and model_type in COMPOSITE_MODELS:
+        forbidden_modules.update(COMPOSITE_MODELS[model_type].audio_model_keys)
 
     module_names = set()
     for name, module in model.named_modules():

@@ -1,3 +1,25 @@
+# LLaMA-Factory for SpeechLMM-v2
+
+> [!NOTE]
+> **This is the SpeechLMM-v2 fork of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory).**
+> It is the training backend of [SpeechLMM-v2](https://github.com/Meetween/speechlmm-v2)
+> and is installed from there as a git submodule; install speechlmm-v2, not this repo.
+>
+> On top of upstream it adds the SpeechLMM template and multimodal plugin (audio,
+> lip-reading video), per-component LoRA and fused Thinker MoE expert LoRA,
+> `trainable_module_paths` under DeepSpeed ZeRO-3, knowledge distillation to a
+> teacher (`src/llamafactory/train/kd/`), and exact dataset resume
+> (`use_stateful_dataloader`).
+>
+> Licensed under Apache 2.0 like upstream; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+> Fork work is part of [Meetween](https://meetween.eu), funded by the European Union
+> under Horizon Europe, grant agreement No. 101135798. Views and opinions expressed
+> are those of the author(s) only and do not necessarily reflect those of the European
+> Union or the European Commission. Neither the European Union nor the granting
+> authority can be held responsible for them.
+>
+> The rest of this README is the upstream LLaMA-Factory documentation.
+
 ![# LLaMA Factory](assets/logo.png)
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/hiyouga/LLaMA-Factory?style=social)](https://github.com/hiyouga/LLaMA-Factory/stargazers)
@@ -488,6 +510,12 @@ huggingface-cli login
 | bitsandbytes | 0.39.0  | 0.43.1    |
 | vllm         | 0.4.3   | 0.8.2     |
 | flash-attn   | 2.5.6   | 2.7.2     |
+
+| System (for multimodal audio/video models) | Minimum | Recommend |
+| ------------------------------------------ | ------- | --------- |
+| ffmpeg                                     | 4       | 7         |
+
+> **Note:** Models like Qwen3-Omni require `torchcodec` (installed automatically) which depends on FFmpeg shared libraries at runtime. Install FFmpeg via your system package manager or conda: `conda install -c conda-forge ffmpeg`. On HPC clusters, you may also need to set `LD_LIBRARY_PATH` to include the conda environment's `lib/` directory.
 
 ### Hardware Requirement
 

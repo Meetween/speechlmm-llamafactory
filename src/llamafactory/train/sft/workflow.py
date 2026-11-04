@@ -18,12 +18,15 @@
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
+from speechlmm.tokens import build_speechlmm_special_tokens
+
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
 from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
+from ..stateful_dataloader import build_stateful_data_config
 from ..trainer_utils import create_modelcard_and_push
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
@@ -46,6 +49,19 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    needs_lipread_tokens = model_args.use_speechlmm_wrapper or (
+        data_args.template == "speechlmm"
+        and (
+            not finetuning_args.freeze_lipread_encoder
+            or not finetuning_args.freeze_lipread_adapter
+        )
+    )
+    if needs_lipread_tokens:
+        original_add_special_tokens = getattr(model_args, "add_special_tokens", None) or []
+        model_args.add_special_tokens = original_add_special_tokens + build_speechlmm_special_tokens(
+            model_args
+        )
+
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
@@ -63,6 +79,7 @@ def run_sft(
         block_diag_attn=model_args.block_diag_attn,
         attn_implementation=getattr(model.config, "_attn_implementation", None),
         compute_dtype=model_args.compute_dtype,
+        media_dir=data_args.media_dir,
         **tokenizer_module,
     )
 
@@ -77,7 +94,7 @@ def run_sft(
     if training_args.predict_with_generate:
         metric_module["compute_metrics"] = ComputeSimilarity(tokenizer=tokenizer)
     elif finetuning_args.compute_accuracy:
-        metric_module["compute_metrics"] = ComputeAccuracy()
+        metric_module["compute_metrics"] = ComputeAccuracy(tokenizer=tokenizer)
         metric_module["preprocess_logits_for_metrics"] = eval_logit_processor
 
     # Keyword arguments for `model.generate`
@@ -124,6 +141,9 @@ def run_sft(
             data_collator=data_collator,
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
+            stateful_data_config=(
+                build_stateful_data_config(data_args) if finetuning_args.use_stateful_dataloader else None
+            ),
             **dataset_module,
             **tokenizer_module,
             **metric_module,
@@ -144,11 +164,13 @@ def run_sft(
         if trainer.is_world_process_zero() and finetuning_args.plot_loss:
             keys = ["loss"]
             if isinstance(dataset_module.get("eval_dataset"), dict):
-                keys += sum(
-                    [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
-                )
+                per_ds = [
+                    [f"eval_{key}_loss", f"eval_{key}_accuracy", f"eval_{key}_wer", f"eval_{key}_cer"]
+                    for key in dataset_module["eval_dataset"].keys()
+                ]
+                keys += sum(per_ds, [])
             else:
-                keys += ["eval_loss", "eval_accuracy"]
+                keys += ["eval_loss", "eval_accuracy", "eval_wer", "eval_cer"]
 
             plot_loss(training_args.output_dir, keys=keys)
 

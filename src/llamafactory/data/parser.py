@@ -43,6 +43,11 @@ class DatasetAttr:
     images: str | None = None
     videos: str | None = None
     audios: str | None = None
+    lipread: str | None = None
+    codec_tokens: str | None = None
+    speaker: str | None = None
+    sample_id: str | None = None
+    codec_cache: str | None = None
     # dpo columns
     chosen: str | None = None
     rejected: str | None = None
@@ -76,12 +81,16 @@ class DatasetAttr:
         self.set_attr("split", attr, default="train")
         self.set_attr("folder", attr)
         self.set_attr("num_samples", attr)
+        self.set_attr("codec_cache", attr)
 
         if "columns" in attr:
             column_names = ["prompt", "query", "response", "history", "messages", "system", "tools"]
-            column_names += ["images", "videos", "audios", "chosen", "rejected", "kto_tag"]
+            column_names += ["images", "videos", "audios", "codec_tokens", "speaker", "sample_id", "chosen", "rejected", "kto_tag", "lipread"]
             for column_name in column_names:
                 self.set_attr(column_name, attr["columns"])
+
+        if self.codec_cache and self.sample_id is None:
+            self.sample_id = "sample_id"
 
         if "tags" in attr:
             tag_names = ["role_tag", "content_tag"]

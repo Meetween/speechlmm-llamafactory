@@ -168,6 +168,7 @@ def _get_merged_dataset(
     training_args: "Seq2SeqTrainingArguments",
     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
     return_dict: bool = False,
+    interleave_probs: list[float] | None = None,
 ) -> Union["Dataset", "IterableDataset", dict[str, "Dataset"]] | None:
     r"""Return the merged datasets in the standard format."""
     if dataset_names is None:
@@ -183,7 +184,9 @@ def _get_merged_dataset(
     if return_dict:
         return datasets
     else:
-        return merge_dataset(list(datasets.values()), data_args, seed=training_args.seed)
+        return merge_dataset(
+            list(datasets.values()), data_args, seed=training_args.seed, interleave_probs=interleave_probs
+        )
 
 
 def _get_dataset_processor(
@@ -283,6 +286,9 @@ def get_dataset(
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
+    if processor is not None and data_args.max_input_audio_seconds is not None:
+        setattr(processor, "max_input_audio_seconds", data_args.max_input_audio_seconds)
+
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:
         if has_tokenized_data(data_args.tokenized_path):
@@ -300,7 +306,23 @@ def get_dataset(
 
     # Load and preprocess dataset
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
-        dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage)
+        dataset = _get_merged_dataset(
+            data_args.dataset,
+            model_args,
+            data_args,
+            training_args,
+            stage,
+            interleave_probs=data_args.interleave_probs,
+        )
+        eval_interleave_probs = data_args.eval_interleave_probs
+        if (
+            eval_interleave_probs is None
+            and data_args.interleave_probs is not None
+            and data_args.eval_dataset is not None
+            and len(data_args.eval_dataset) == len(data_args.interleave_probs)
+        ):
+            eval_interleave_probs = data_args.interleave_probs
+
         eval_dataset = _get_merged_dataset(
             data_args.eval_dataset,
             model_args,
@@ -308,6 +330,7 @@ def get_dataset(
             training_args,
             stage,
             return_dict=data_args.eval_on_each_dataset,
+            interleave_probs=eval_interleave_probs,
         )
 
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):

@@ -107,6 +107,7 @@ def _gradient_checkpointing_enable(
     self: "PreTrainedModel",
     gradient_checkpointing_kwargs: Optional[dict[str, Any]] = None,
     use_unsloth_gc: bool = False,
+    gradient_checkpointing_all_layers: bool = False,
 ) -> None:
     r"""Activates gradient checkpointing for the current model.
 
@@ -125,7 +126,9 @@ def _gradient_checkpointing_enable(
     else:
         gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
 
-    gradient_checkpointing_func = get_custom_gradient_checkpointing_func(gradient_checkpointing_func)
+    if not gradient_checkpointing_all_layers:
+        gradient_checkpointing_func = get_custom_gradient_checkpointing_func(gradient_checkpointing_func)
+
     if "value" in inspect.signature(self._set_gradient_checkpointing).parameters:  # old GC format
         self.apply(partial(self._set_gradient_checkpointing, value=True))
         self.enable_input_require_grads()
@@ -168,7 +171,9 @@ def prepare_model_for_training(model: "PreTrainedModel", model_args: "ModelArgum
             # use_reentrant=False might increase VRAM usage (have not been empirically verified yet)
             # According to: https://github.com/huggingface/transformers/issues/28339
             gradient_checkpointing_enable = partial(
-                _gradient_checkpointing_enable, use_unsloth_gc=model_args.use_unsloth_gc
+                _gradient_checkpointing_enable,
+                use_unsloth_gc=model_args.use_unsloth_gc,
+                gradient_checkpointing_all_layers=model_args.gradient_checkpointing_all_layers,
             )
             model.gradient_checkpointing_enable = MethodType(gradient_checkpointing_enable, model)
             model.gradient_checkpointing_enable(

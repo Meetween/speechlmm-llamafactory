@@ -23,12 +23,14 @@ from transformers import EarlyStoppingCallback, PreTrainedModel
 from ..data import get_template_and_fix_tokenizer
 from ..extras import logging
 from ..extras.constants import V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
+from ..extras.file_perms import install_safetensors_umask
 from ..extras.misc import find_available_port, get_device_name, get_torch_device, infer_optim_dtype
 from ..extras.packages import is_mcore_adapter_available, is_ray_available
 from ..hparams import RayArguments, get_infer_args, get_ray_args, get_train_args, read_args
 from ..model import load_model, load_tokenizer
-from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback
+from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback, SaveTrainableModulesCallback
 from .dpo import run_dpo
+from .kd import run_kd
 from .kto import run_kto
 from .ppo import run_ppo
 from .pt import run_pt
@@ -69,6 +71,16 @@ def _training_function(config: dict[str, Any]) -> None:
     if finetuning_args.early_stopping_steps is not None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=finetuning_args.early_stopping_steps))
 
+    trainable_paths = getattr(finetuning_args, "trainable_module_paths", None)
+    periodic_save_steps = getattr(model_args, "periodic_trainable_save_steps", None)
+    if periodic_save_steps is not None:
+        if not trainable_paths:
+            raise ValueError("periodic_trainable_save_steps requires trainable_module_paths.")
+        if training_args.save_strategy != "no":
+            raise ValueError("periodic_trainable_save_steps requires save_strategy: 'no'.")
+    if trainable_paths:
+        callbacks.append(SaveTrainableModulesCallback(trainable_paths, periodic_save_steps))
+
     callbacks.append(ReporterCallback(model_args, data_args, finetuning_args, generating_args))  # add to last
 
     if finetuning_args.stage in ["pt", "sft", "dpo"] and finetuning_args.use_mca:
@@ -99,6 +111,8 @@ def _training_function(config: dict[str, Any]) -> None:
         run_dpo(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "kto":
         run_kto(model_args, data_args, training_args, finetuning_args, callbacks)
+    elif finetuning_args.stage == "kd":
+        run_kd(model_args, data_args, training_args, finetuning_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
@@ -113,6 +127,7 @@ def _training_function(config: dict[str, Any]) -> None:
 
 
 def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["TrainerCallback"]] = None) -> None:
+    install_safetensors_umask()
     args = read_args(args)
     if "-h" in args or "--help" in args:
         get_train_args(args)
@@ -126,6 +141,7 @@ def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["Tra
 
 
 def export_model(args: Optional[dict[str, Any]] = None) -> None:
+    install_safetensors_umask()
     model_args, data_args, finetuning_args, _ = get_infer_args(args)
 
     if model_args.export_dir is None:

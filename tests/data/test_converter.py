@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+
 import pytest
 
 from llamafactory.data import Role
@@ -38,6 +40,9 @@ def test_alpaca_converter():
         "_images": None,
         "_videos": None,
         "_audios": None,
+        "_lipread": None,
+        "_codec_tokens": None,
+        "_speaker": None,
     }
 
 
@@ -61,4 +66,109 @@ def test_sharegpt_converter():
         "_images": None,
         "_videos": None,
         "_audios": None,
+        "_lipread": None,
+        "_codec_tokens": None,
+        "_speaker": None,
     }
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_alpaca_explicit_speaker_and_codec():
+    dataset_attr = DatasetAttr("hf_hub", "llamafactory/tiny-supervised-dataset")
+    dataset_attr.speaker = "spk"
+    dataset_attr.codec_tokens = "codec_tokens"
+    data_args = DataArguments()
+    example = {
+        "instruction": "Say hi.",
+        "input": "",
+        "output": "Hello.",
+        "spk": "ethan",
+        "speaker": "ignored",
+        "codec_tokens": [1, 2, 3],
+    }
+    converted = get_dataset_converter("alpaca", dataset_attr, data_args)(example)
+    assert converted["_speaker"] == "ethan"
+    assert converted["_codec_tokens"] == [1, 2, 3]
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_alpaca_implicit_speaker_ignored():
+    dataset_attr = DatasetAttr("hf_hub", "llamafactory/tiny-supervised-dataset")
+    data_args = DataArguments()
+    example = {
+        "instruction": "Say hi.",
+        "input": "",
+        "output": "Hello.",
+        "speaker": "ethan",
+    }
+    converted = get_dataset_converter("alpaca", dataset_attr, data_args)(example)
+    assert converted["_speaker"] is None
+    assert converted["_codec_tokens"] is None
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_join_codec_cache_defaults_sample_id():
+    dataset_attr = DatasetAttr("file", "talker.json")
+    dataset_attr.join(
+        {
+            "formatting": "sharegpt",
+            "codec_cache": "/tmp/talker-codec-cache/qwen2_5_omni/qwen25-distill-v1",
+            "columns": {"messages": "messages", "speaker": "speaker"},
+        }
+    )
+    assert dataset_attr.codec_cache.endswith("qwen25-distill-v1")
+    assert dataset_attr.sample_id == "sample_id"
+    assert dataset_attr.speaker == "speaker"
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_codec_cache_lookup_uses_declared_sample_id(monkeypatch):
+    class FakeRecord:
+        codes = [9, 8, 7]
+
+    class FakeCache:
+        @classmethod
+        def from_dir(cls, path):
+            assert str(path).endswith("qwen25-distill-v1")
+            return cls()
+
+        def lookup(self, sample_id=None, sha256=None):
+            assert sample_id == "utt-1"
+            return FakeRecord()
+
+    fake_mod = type(sys)("speechlmm.data.codec_cache")
+    fake_mod.CodecCache = FakeCache
+    monkeypatch.setitem(sys.modules, "speechlmm.data.codec_cache", fake_mod)
+
+    dataset_attr = DatasetAttr("file", "talker.json")
+    dataset_attr.join(
+        {
+            "formatting": "sharegpt",
+            "codec_cache": "/tmp/talker-codec-cache/qwen2_5_omni/qwen25-distill-v1",
+            "columns": {"messages": "conversations", "sample_id": "sample_id"},
+        }
+    )
+    example = {
+        "conversations": [
+            {"from": "human", "value": "Read this."},
+            {"from": "gpt", "value": "ok"},
+        ],
+        "sample_id": "utt-1",
+        "speaker": "ignored-unless-declared",
+    }
+    converted = get_dataset_converter("sharegpt", dataset_attr, DataArguments())(example)
+    assert converted["_codec_tokens"] == [9, 8, 7]
+    assert converted["_speaker"] is None
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_join_explicit_sample_id_column():
+    dataset_attr = DatasetAttr("file", "talker.json")
+    dataset_attr.join(
+        {
+            "formatting": "sharegpt",
+            "codec_cache": "/tmp/cache",
+            "columns": {"messages": "messages", "sample_id": "id"},
+        }
+    )
+    assert dataset_attr.sample_id == "id"

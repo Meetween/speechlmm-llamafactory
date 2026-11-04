@@ -74,11 +74,11 @@ def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] 
     if len(sys.argv) > 1 and (sys.argv[1].endswith(".yaml") or sys.argv[1].endswith(".yml")):
         override_config = OmegaConf.from_cli(sys.argv[2:])
         dict_config = OmegaConf.load(Path(sys.argv[1]).absolute())
-        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
+        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config), resolve=True)
     elif len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
         override_config = OmegaConf.from_cli(sys.argv[2:])
         dict_config = OmegaConf.create(json.load(Path(sys.argv[1]).absolute()))
-        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
+        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config), resolve=True)
     else:
         return sys.argv[1:]
 
@@ -138,6 +138,33 @@ def _verify_model_args(
 
         if model_args.adapter_name_or_path is not None and len(model_args.adapter_name_or_path) != 1:
             raise ValueError("Quantized model only accepts a single adapter. Merge them first.")
+
+    if getattr(finetuning_args, "lora_language_model_experts", False):
+        if finetuning_args.finetuning_type != "lora":
+            raise ValueError("lora_language_model_experts requires finetuning_type='lora'.")
+        if not getattr(finetuning_args, "lora_language_model", False):
+            raise ValueError("lora_language_model_experts requires lora_language_model=True.")
+        if model_args.quantization_bit is not None:
+            raise ValueError("lora_language_model_experts does not support quantized base weights.")
+        if model_args.use_unsloth:
+            raise ValueError("lora_language_model_experts is not supported with Unsloth.")
+        if model_args.use_kt:
+            raise ValueError("lora_language_model_experts is not supported with KTransformers.")
+        if finetuning_args.use_dora:
+            raise ValueError("lora_language_model_experts does not support DoRA.")
+        if finetuning_args.pissa_init:
+            raise ValueError("lora_language_model_experts does not support PiSSA initialization.")
+        init_weights = getattr(finetuning_args, "init_lora_weights", True)
+        if init_weights not in (True, False, "gaussian", None):
+            raise ValueError(
+                "lora_language_model_experts only supports standard LoRA initialization "
+                "(true / false / gaussian)."
+            )
+        if model_args.adapter_name_or_path is not None and len(model_args.adapter_name_or_path) > 1:
+            raise ValueError(
+                "lora_language_model_experts supports a single adapter under ZeRO-3; "
+                "merge multiple adapters before loading."
+            )
 
 
 def _check_extra_dependencies(
@@ -258,6 +285,12 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
 
         if data_args.train_on_prompt or data_args.mask_history:
             raise ValueError("`train_on_prompt` or `mask_history` cannot be set as True except SFT.")
+
+        if finetuning_args.use_stateful_dataloader:
+            raise ValueError("`use_stateful_dataloader` cannot be set as True except SFT.")
+
+    if finetuning_args.use_stateful_dataloader and model_args.use_kt:
+        raise ValueError("`use_stateful_dataloader` is not supported with KTransformers.")
 
     if finetuning_args.stage == "sft" and training_args.do_predict and not training_args.predict_with_generate:
         raise ValueError("Please enable `predict_with_generate` to save model predictions.")
@@ -434,6 +467,17 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             training_args.resume_from_checkpoint = last_checkpoint
             logger.info_rank0(f"Resuming training from {training_args.resume_from_checkpoint}.")
             logger.info_rank0("Change `output_dir` or use `overwrite_output_dir` to avoid.")
+
+    if finetuning_args.use_stateful_dataloader and not training_args.ignore_data_skip:
+        logger.info_rank0(
+            "Set `ignore_data_skip` to True since the dataloader position is restored from the checkpoint."
+        )
+        training_args.ignore_data_skip = True
+
+    if finetuning_args.use_stateful_dataloader and data_args.streaming:
+        logger.warning_rank0(
+            "`use_stateful_dataloader` with `streaming: true` uses the untested DataLoaderDispatcher path."
+        )
 
     if (
         finetuning_args.stage in ["rm", "ppo"]

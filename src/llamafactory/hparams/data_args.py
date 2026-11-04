@@ -47,6 +47,13 @@ class DataArguments:
         default=2048,
         metadata={"help": "The cutoff length of the tokenized inputs in the dataset."},
     )
+    max_input_audio_seconds: float | None = field(
+        default=None,
+        metadata={
+            "help": "Max input audio length (seconds) before feature-extractor truncation. "
+            "When unset, the Whisper feature extractor uses its default (no YAML cap)."
+        },
+    )
     train_on_prompt: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the mask on the prompt."},
@@ -71,7 +78,15 @@ class DataArguments:
     )
     interleave_probs: str | None = field(
         default=None,
-        metadata={"help": "Probabilities to sample data from datasets. Use commas to separate multiple datasets."},
+        metadata={
+            "help": "Probabilities to sample training data from datasets. Use commas to separate multiple datasets."
+        },
+    )
+    eval_interleave_probs: str | None = field(
+        default=None,
+        metadata={
+            "help": "Probabilities to sample evaluation data from datasets. Use commas to separate multiple datasets."
+        },
     )
     overwrite_cache: bool = field(
         default=False,
@@ -166,8 +181,16 @@ class DataArguments:
             if self.dataset is not None and len(self.dataset) != len(self.interleave_probs):
                 raise ValueError("The length of dataset and interleave probs should be identical.")
 
-            if self.eval_dataset is not None and len(self.eval_dataset) != len(self.interleave_probs):
-                raise ValueError("The length of eval dataset and interleave probs should be identical.")
+        if self.eval_interleave_probs is not None:
+            if self.mix_strategy == "concat":
+                raise ValueError("`eval_interleave_probs` is only valid for interleaved mixing.")
+
+            if self.eval_on_each_dataset:
+                raise ValueError("`eval_interleave_probs` is ignored when `eval_on_each_dataset` is enabled.")
+
+            self.eval_interleave_probs = list(map(float, split_arg(self.eval_interleave_probs)))
+            if self.eval_dataset is not None and len(self.eval_dataset) != len(self.eval_interleave_probs):
+                raise ValueError("The length of eval dataset and eval interleave probs should be identical.")
 
         if self.streaming and self.val_size > 1e-6 and self.val_size < 1:
             raise ValueError("Streaming mode should have an integer val size.")
